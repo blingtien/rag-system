@@ -80,6 +80,16 @@ cache/
 *.sqlite
 *.sqlite3
 
+# RAG-Anything specific excludes (keep code, exclude data/models)
+RAG-Anything/rag_storage/
+RAG-Anything/output/
+RAG-Anything/cache/
+RAG-Anything/models/
+RAG-Anything/.env
+RAG-Anything/**/*.db
+RAG-Anything/**/*.sqlite
+RAG-Anything/**/*.sqlite3
+
 # Temporary files
 tmp/
 temp/
@@ -97,7 +107,6 @@ temp/
 web-api/models/
 
 # Sub-repositories (to be added as submodules later)
-RAG-Anything/
 SuperClaude_Framework/
 
 # Test outputs

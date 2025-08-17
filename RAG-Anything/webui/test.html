@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG-Anything API 测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .section { margin: 20px 0; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+        .result { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 4px; white-space: pre-wrap; }
+        .error { background: #ffe6e6; color: #d00; }
+        .success { background: #e6ffe6; color: #060; }
+        button { background: #007cba; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #005a87; }
+        input[type="file"] { margin: 10px 0; }
+        textarea { width: 100%; height: 100px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>RAG-Anything API 测试界面</h1>
+        
+        <!-- 健康检查 -->
+        <div class="section">
+            <h2>1. 健康检查</h2>
+            <button onclick="testHealth()">测试 /health 端点</button>
+            <div id="healthResult" class="result"></div>
+        </div>
+
+        <!-- 文档上传 -->
+        <div class="section">
+            <h2>2. 文档上传</h2>
+            <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.txt,.md">
+            <button onclick="testUpload()">上传文档</button>
+            <div id="uploadResult" class="result"></div>
+        </div>
+
+        <!-- 文档列表 -->
+        <div class="section">
+            <h2>3. 文档列表</h2>
+            <button onclick="testDocuments()">获取文档列表</button>
+            <div id="documentsResult" class="result"></div>
+        </div>
+
+        <!-- 查询测试 -->
+        <div class="section">
+            <h2>4. 智能查询</h2>
+            <textarea id="queryInput" placeholder="输入您的查询问题...">测试文档中有什么内容？</textarea>
+            <button onclick="testQuery()">执行查询</button>
+            <div id="queryResult" class="result"></div>
+        </div>
+    </div>
+
+    <script>
+        async function testHealth() {
+            const resultDiv = document.getElementById('healthResult');
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = 'result success';
+            } catch (error) {
+                resultDiv.textContent = 'Error: ' + error.message;
+                resultDiv.className = 'result error';
+            }
+        }
+
+        async function testUpload() {
+            const resultDiv = document.getElementById('uploadResult');
+            const fileInput = document.getElementById('fileInput');
+            
+            if (!fileInput.files[0]) {
+                resultDiv.textContent = '请先选择一个文件';
+                resultDiv.className = 'result error';
+                return;
+            }
+
+            try {
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                
+                const response = await fetch('/documents/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = 'result success';
+            } catch (error) {
+                resultDiv.textContent = 'Error: ' + error.message;
+                resultDiv.className = 'result error';
+            }
+        }
+
+        async function testDocuments() {
+            const resultDiv = document.getElementById('documentsResult');
+            try {
+                const response = await fetch('/documents');
+                const data = await response.json();
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = 'result success';
+            } catch (error) {
+                resultDiv.textContent = 'Error: ' + error.message;
+                resultDiv.className = 'result error';
+            }
+        }
+
+        async function testQuery() {
+            const resultDiv = document.getElementById('queryResult');
+            const queryInput = document.getElementById('queryInput');
+            
+            if (!queryInput.value.trim()) {
+                resultDiv.textContent = '请输入查询问题';
+                resultDiv.className = 'result error';
+                return;
+            }
+
+            try {
+                const response = await fetch('/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        query: queryInput.value.trim(),
+                        mode: 'hybrid'
+                    })
+                });
+                
+                const data = await response.json();
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = 'result success';
+            } catch (error) {
+                resultDiv.textContent = 'Error: ' + error.message;
+                resultDiv.className = 'result error';
+            }
+        }
+    </script>
+</body>
+</html>
