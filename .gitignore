@@ -106,8 +106,62 @@ temp/
 *.onnx
 web-api/models/
 
+# Model cache directories (HuggingFace)
+1/1/models--*/
+1/1/.locks/
+RAG-Anything/api/models/
+models--*/
+.locks/
+
+# Processing output directories  
+1/*/tmp*/
+1/*/*_content_list.json
+1/*/*.pdf
+1/*/*.json
+
 # Sub-repositories (to be added as submodules later)
 SuperClaude_Framework/
+LightRAG/
 
 # Test outputs
 test_report_*.json
+
+# Upload directories (user uploaded files)
+uploads/
+
+# System directories and generated files
+.playwright-mcp/
+
+# API keys and sensitive configuration
+api_keys.txt
+*.key
+*.pem
+
+# MacOS system files
+.DS_Store
+
+# Windows system files
+Thumbs.db
+
+# Editor backup files
+*~
+
+# Python pytest cache
+.pytest_cache/
+
+# Coverage reports
+htmlcov/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Model weights and embeddings (too large for git)
+*.pt
+*.pth
+embeddings/
+
+# Generated API documentation
+api-docs/
+
+# Temporary data processing files
+processing_temp/

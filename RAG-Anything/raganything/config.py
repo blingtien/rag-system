@@ -138,7 +138,14 @@ class RAGAnythingConfig:
     """Directory to cache downloaded models."""
 
     def __post_init__(self):
-        """Post-initialization setup for backward compatibility"""
+        """Post-initialization setup for backward compatibility and path normalization"""
+        import os
+        
+        # Normalize all directory paths to absolute paths
+        self.working_dir = os.path.abspath(self.working_dir)
+        self.parser_output_dir = os.path.abspath(self.parser_output_dir)
+        self.model_cache_dir = os.path.abspath(self.model_cache_dir)
+        
         # Support legacy environment variable names for backward compatibility
         legacy_parse_method = get_env_value("MINERU_PARSE_METHOD", None, str)
         if legacy_parse_method and not get_env_value("PARSE_METHOD", None, str):
