@@ -16,6 +16,12 @@ from typing import Dict, List, Optional
 from pathlib import Path
 import sys
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,10 +66,10 @@ tasks: Dict[str, dict] = {}
 documents: Dict[str, dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
 
-# 配置 - 统一使用绝对路径，统一到RAG-Anything/rag_storage目录
+# 配置 - 统一使用绝对路径，指向RAG-Anything根目录的存储
 UPLOAD_DIR = os.path.abspath("../../uploads")
-WORKING_DIR = os.path.abspath(os.getenv("WORKING_DIR", "./rag_storage"))
-OUTPUT_DIR = os.path.abspath(os.getenv("OUTPUT_DIR", "./output"))
+WORKING_DIR = os.getenv("WORKING_DIR", "/home/ragsvr/projects/ragsystem/rag_storage")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/home/ragsvr/projects/ragsystem/output")
 
 # 确保目录存在
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -724,11 +730,13 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         rag.config.parser = parser_config.parser
         
         try:
-            # 调用RAGAnything处理文档
+            # 调用RAGAnything处理文档，添加GPU设备配置
             await rag.process_document_complete(
                 file_path=file_path, 
                 output_dir=OUTPUT_DIR,
-                parse_method=parser_config.method
+                parse_method=parser_config.method,
+                device="cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu",
+                lang="en"  # 使用英文语言配置，MinerU不支持"auto"
             )
             
             # 尝试获取解析结果来更新内容统计
