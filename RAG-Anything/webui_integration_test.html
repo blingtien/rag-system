@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LightRAG WebUI + RAG-Anything Integration Test</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+        
+        .header {
+            background: #2563eb;
+            color: white;
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }
+        
+        .card-header {
+            background: #f8fafc;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #e2e8f0;
+            font-weight: 600;
+            color: #475569;
+        }
+        
+        .card-content {
+            padding: 1.5rem;
+        }
+        
+        .upload-area {
+            border: 2px dashed #cbd5e1;
+            border-radius: 8px;
+            padding: 2rem;
+            text-align: center;
+            background: #f8fafc;
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover {
+            border-color: #2563eb;
+            background: #eff6ff;
+        }
+        
+        .upload-area.dragover {
+            border-color: #2563eb;
+            background: #dbeafe;
+        }
+        
+        .upload-icon {
+            font-size: 3rem;
+            color: #64748b;
+            margin-bottom: 1rem;
+        }
+        
+        .btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+        
+        .btn:hover {
+            background: #1d4ed8;
+        }
+        
+        .btn:disabled {
+            background: #94a3b8;
+            cursor: not-allowed;
+        }
+        
+        .progress-container {
+            margin-top: 1rem;
+            display: none;
+        }
+        
+        .progress-label {
+            font-size: 0.875rem;
+            color: #475569;
+            margin-bottom: 0.5rem;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: #2563eb;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        
+        .progress-text {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }
+        
+        .task-monitor {
+            background: #1e293b;
+            color: white;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.875rem;
+            max-height: 400px;
+            overflow-y: auto;
+            line-height: 1.4;
+        }
+        
+        .task-monitor .stage {
+            margin: 0.5rem 0;
+            padding: 0.25rem 0;
+        }
+        
+        .task-monitor .stage.completed {
+            color: #10b981;
+        }
+        
+        .task-monitor .stage.running {
+            color: #f59e0b;
+        }
+        
+        .task-monitor .stage.pending {
+            color: #6b7280;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        
+        .stat-item {
+            background: #f1f5f9;
+            padding: 1rem;
+            border-radius: 6px;
+            text-align: center;
+        }
+        
+        .stat-number {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #2563eb;
+        }
+        
+        .stat-label {
+            font-size: 0.75rem;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        /* Document table styles */
+        .document-table-container {
+            overflow-x: auto;
+        }
+        
+        .document-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+        
+        .document-table th,
+        .document-table td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        .document-table th {
+            background: #f8fafc;
+            font-weight: 600;
+            color: #374151;
+        }
+        
+        .document-table tr:hover {
+            background: #f8fafc;
+        }
+        
+        .action-btn {
+            padding: 0.25rem 0.5rem;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            transition: all 0.2s;
+        }
+        
+        .action-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .action-btn.play {
+            background: #10b981;
+            color: white;
+        }
+        
+        .action-btn.play:hover {
+            background: #059669;
+        }
+        
+        .action-btn.loading {
+            background: #f59e0b;
+            color: white;
+        }
+        
+        .action-btn.completed {
+            background: #6b7280;
+            color: white;
+        }
+        
+        .action-btn.retry {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .action-btn.retry:hover {
+            background: #dc2626;
+        }
+        
+        .status-text {
+            font-size: 0.8rem;
+            line-height: 1.2;
+        }
+        
+        .status-text.processing {
+            color: #f59e0b;
+        }
+        
+        .status-text.completed {
+            color: #10b981;
+        }
+        
+        .status-text.failed {
+            color: #ef4444;
+        }
+        
+        .status-text.uploaded {
+            color: #6b7280;
+        }
+        
+        .btn-refresh {
+            background: #e2e8f0;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .btn-refresh:hover {
+            background: #cbd5e1;
+        }
+        
+        .api-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+        
+        .api-status.healthy {
+            background: #dcfce7;
+            color: #166534;
+        }
+        
+        .api-status.error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        #fileInput {
+            display: none;
+        }
+        
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+        
+        @media (max-width: 768px) {
+            .grid-2 {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 0 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 LightRAG WebUI + RAG-Anything Integration</h1>
+    </div>
+    
+    <div class="container">
+        <!-- API Status Card -->
+        <div class="card">
+            <div class="card-header">
+                API Status & Health Check
+            </div>
+            <div class="card-content">
+                <div id="apiStatus" class="api-status error">
+                    <div class="status-dot"></div>
+                    <span>Checking...</span>
+                </div>
+                <button id="checkHealthBtn" class="btn" style="margin-left: 1rem;">
+                    Check Health
+                </button>
+            </div>
+        </div>
+        
+        <div class="grid-2">
+            <!-- Document Upload Card -->
+            <div class="card">
+                <div class="card-header">
+                    📤 Document Upload & Processing
+                </div>
+                <div class="card-content">
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-icon">📄</div>
+                        <p><strong>Click to select files</strong> or drag and drop</p>
+                        <p style="color: #64748b; font-size: 0.875rem; margin-top: 0.5rem;">
+                            Support: PDF, DOCX, TXT, MD files
+                        </p>
+                    </div>
+                    <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.txt,.md" multiple>
+                    
+                    <div class="progress-container" id="progressContainer">
+                        <div class="progress-label" id="progressLabel">Uploading...</div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                        <div class="progress-text" id="progressText">0%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Multimodal Statistics -->
+            <div class="card">
+                <div class="card-header">
+                    📊 Multimodal Processing Statistics
+                </div>
+                <div class="card-content">
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-number" id="imagesCount">0</div>
+                            <div class="stat-label">Images</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number" id="tablesCount">0</div>
+                            <div class="stat-label">Tables</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number" id="equationsCount">0</div>
+                            <div class="stat-label">Equations</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-number" id="successRate">0%</div>
+                            <div class="stat-label">Success Rate</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Unified Document Management -->
+        <div class="card">
+            <div class="card-header">
+                📄 文档管理 - 统一处理区域
+                <button class="btn-refresh" id="refreshDocsBtn" style="float: right; padding: 0.25rem 0.5rem; font-size: 0.75rem;">刷新</button>
+            </div>
+            <div class="card-content">
+                <div class="document-table-container">
+                    <table class="document-table" id="documentTable">
+                        <thead>
+                            <tr>
+                                <th>文档名称</th>
+                                <th>文件大小</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="documentTableBody">
+                            <tr class="empty-row">
+                                <td colspan="4" style="text-align: center; color: #64748b; padding: 2rem;">
+                                    暂无文档，请上传文件
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://127.0.0.1:8000';
+        let currentWebSocket = null;
+        let currentTaskId = null;
+
+        // API健康检查
+        async function checkAPIHealth() {
+            const statusEl = document.getElementById('apiStatus');
+            statusEl.className = 'api-status error';
+            statusEl.innerHTML = '<div class="status-dot"></div><span>Checking...</span>';
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/health`);
+                const data = await response.json();
+                
+                if (data.status === 'healthy') {
+                    statusEl.className = 'api-status healthy';
+                    statusEl.innerHTML = '<div class="status-dot"></div><span>RAG-Anything API Healthy</span>';
+                    return true;
+                } else {
+                    throw new Error('API not healthy');
+                }
+            } catch (error) {
+                statusEl.className = 'api-status error';
+                statusEl.innerHTML = '<div class="status-dot"></div><span>API Unavailable</span>';
+                return false;
+            }
+        }
+
+        // 文件上传处理
+        async function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const progressContainer = document.getElementById('progressContainer');
+            const progressFill = document.getElementById('progressFill');
+            const progressText = document.getElementById('progressText');
+            const progressLabel = document.getElementById('progressLabel');
+            
+            progressContainer.style.display = 'block';
+            progressLabel.textContent = `Uploading ${file.name}...`;
+            
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const percentComplete = (e.loaded / e.total) * 100;
+                        progressFill.style.width = percentComplete + '%';
+                        progressText.textContent = Math.round(percentComplete) + '%';
+                    }
+                });
+                
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        const response = JSON.parse(xhr.responseText);
+                        progressLabel.textContent = 'Upload complete! Starting processing...';
+                        resolve(response);
+                    } else {
+                        reject(new Error(`Upload failed: ${xhr.statusText}`));
+                    }
+                };
+                
+                xhr.onerror = function() {
+                    reject(new Error('Upload failed: Network error'));
+                };
+                
+                xhr.open('POST', `${API_BASE_URL}/api/v1/documents/upload`);
+                xhr.send(formData);
+            });
+        }
+
+        // 加载文档列表
+        async function loadDocumentList() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/v1/documents`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateDocumentTable(data.documents);
+                }
+            } catch (error) {
+                console.error('Failed to load document list:', error);
+            }
+        }
+        
+        // 更新文档表格
+        function updateDocumentTable(documents) {
+            const tableBody = document.getElementById('documentTableBody');
+            
+            if (documents.length === 0) {
+                tableBody.innerHTML = `
+                    <tr class="empty-row">
+                        <td colspan="4" style="text-align: center; color: #64748b; padding: 2rem;">
+                            暂无文档，请上传文件
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+            
+            tableBody.innerHTML = documents.map(doc => `
+                <tr data-document-id="${doc.document_id}">
+                    <td>${doc.file_name}</td>
+                    <td>${formatFileSize(doc.file_size)}</td>
+                    <td>
+                        <span class="status-text ${doc.status_code}">
+                            ${doc.status_display}
+                        </span>
+                    </td>
+                    <td>
+                        <button class="action-btn ${doc.action_icon}" 
+                                data-action="${doc.action_type}"
+                                data-document-id="${doc.document_id}"
+                                ${!doc.can_process ? 'disabled' : ''}
+                                onclick="handleDocumentAction('${doc.document_id}', '${doc.action_type}')">
+                            ${getActionIcon(doc.action_icon)} ${doc.action_text}
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        
+        // 格式化文件大小
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+        
+        // 获取操作按钮图标
+        function getActionIcon(iconType) {
+            const icons = {
+                play: '▶️',
+                loading: '⏳',
+                check: '✅',
+                refresh: '🔄',
+                question: '❓'
+            };
+            return icons[iconType] || '❓';
+        }
+        
+        // 处理文档操作
+        async function handleDocumentAction(documentId, actionType) {
+            if (actionType === 'start_processing' || actionType === 'retry') {
+                try {
+                    const response = await fetch(`${API_BASE_URL}/api/v1/documents/${documentId}/process`, {
+                        method: 'POST'
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        // 启动WebSocket监控处理进度
+                        connectDocumentWebSocket(result.task_id, documentId);
+                        // 立即刷新文档列表
+                        setTimeout(() => loadDocumentList(), 500);
+                    } else {
+                        alert('启动处理失败: ' + (result.message || '未知错误'));
+                    }
+                } catch (error) {
+                    console.error('Failed to start processing:', error);
+                    alert('启动处理失败: ' + error.message);
+                }
+            }
+        }
+        
+        // WebSocket连接监控文档处理进度
+        function connectDocumentWebSocket(taskId, documentId) {
+            if (currentWebSocket) {
+                currentWebSocket.close();
+            }
+            
+            currentTaskId = taskId;
+            const wsUrl = `ws://127.0.0.1:8000/ws/task/${taskId}`;
+            currentWebSocket = new WebSocket(wsUrl);
+            
+            currentWebSocket.onopen = function() {
+                console.log('WebSocket connected for task:', taskId);
+            };
+            
+            currentWebSocket.onmessage = function(event) {
+                const taskData = JSON.parse(event.data);
+                updateDocumentProgress(taskData, documentId);
+                
+                // 更新多模态统计
+                updateMultimodalStats(taskData);
+                
+                // 如果处理完成，刷新文档列表
+                if (taskData.status === 'completed' || taskData.status === 'failed') {
+                    setTimeout(() => loadDocumentList(), 1000);
+                }
+            };
+            
+            currentWebSocket.onclose = function() {
+                console.log('WebSocket connection closed.');
+            };
+            
+            currentWebSocket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        // 更新文档处理进度
+        function updateDocumentProgress(taskData, documentId) {
+            // 更新文档表格中的状态
+            const documentRow = document.querySelector(`tr[data-document-id="${documentId}"]`);
+            if (documentRow) {
+                const statusCell = documentRow.querySelector('.status-text');
+                const actionBtn = documentRow.querySelector('.action-btn');
+                
+                if (statusCell && actionBtn) {
+                    const progress = Math.round(taskData.progress || 0);
+                    const stage = taskData.stage || 'processing';
+                    
+                    // 更新状态显示
+                    const stageNames = {
+                        'parsing': '解析文档',
+                        'separation': '分离内容',
+                        'text_insert': '插入文本',
+                        'image_process': '处理图片',
+                        'table_process': '处理表格',
+                        'equation_process': '处理公式',
+                        'graph_build': '构建知识图谱',
+                        'indexing': '创建索引'
+                    };
+                    
+                    const stageDisplay = stageNames[stage] || '处理中';
+                    statusCell.textContent = `解析中 - ${stageDisplay}`;
+                    statusCell.className = 'status-text processing';
+                    
+                    // 更新操作按钮
+                    actionBtn.innerHTML = `⏳ ${progress}%`;
+                    actionBtn.className = 'action-btn loading';
+                    actionBtn.disabled = true;
+                    
+                    if (taskData.status === 'completed') {
+                        statusCell.textContent = '已完成 - 解析成功';
+                        statusCell.className = 'status-text completed';
+                        actionBtn.innerHTML = '✅ 已完成';
+                        actionBtn.className = 'action-btn completed';
+                    } else if (taskData.status === 'failed') {
+                        statusCell.textContent = '解析失败 - ' + (taskData.error_message || '未知错误');
+                        statusCell.className = 'status-text failed';
+                        actionBtn.innerHTML = '🔄 重试';
+                        actionBtn.className = 'action-btn retry';
+                        actionBtn.disabled = false;
+                    }
+                }
+            }
+        }
+        
+        // 更新多模态统计
+        function updateMultimodalStats(taskData) {
+            if (taskData.multimodal_stats) {
+                document.getElementById('imagesCount').textContent = taskData.multimodal_stats.images_processed || 0;
+                document.getElementById('tablesCount').textContent = taskData.multimodal_stats.tables_processed || 0;
+                document.getElementById('equationsCount').textContent = taskData.multimodal_stats.equations_processed || 0;
+                document.getElementById('successRate').textContent = Math.round(taskData.multimodal_stats.processing_success_rate || 0) + '%';
+            }
+        }
+
+
+        // 事件监听器设置
+        document.addEventListener('DOMContentLoaded', function() {
+            const uploadArea = document.getElementById('uploadArea');
+            const fileInput = document.getElementById('fileInput');
+            const checkHealthBtn = document.getElementById('checkHealthBtn');
+            
+            // 健康检查
+            checkHealthBtn.addEventListener('click', checkAPIHealth);
+            
+            // 刷新文档列表按钮
+            const refreshDocsBtn = document.getElementById('refreshDocsBtn');
+            refreshDocsBtn.addEventListener('click', loadDocumentList);
+            
+            // 初始健康检查和文档列表加载
+            checkAPIHealth();
+            loadDocumentList();
+            
+            // 上传区域点击
+            uploadArea.addEventListener('click', () => {
+                fileInput.click();
+            });
+            
+            // 拖拽支持
+            uploadArea.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                uploadArea.classList.add('dragover');
+            });
+            
+            uploadArea.addEventListener('dragleave', () => {
+                uploadArea.classList.remove('dragover');
+            });
+            
+            uploadArea.addEventListener('drop', (e) => {
+                e.preventDefault();
+                uploadArea.classList.remove('dragover');
+                const files = Array.from(e.dataTransfer.files);
+                handleFiles(files);
+            });
+            
+            // 文件选择
+            fileInput.addEventListener('change', (e) => {
+                const files = Array.from(e.target.files);
+                handleFiles(files);
+            });
+            
+            async function handleFiles(files) {
+                if (files.length === 0) return;
+                
+                const file = files[0]; // 处理第一个文件
+                
+                try {
+                    const response = await uploadFile(file);
+                    
+                    if (response.success) {
+                        // 上传成功，刷新文档列表
+                        setTimeout(() => {
+                            loadDocumentList();
+                            document.getElementById('progressContainer').style.display = 'none';
+                        }, 500);
+                        
+                    } else {
+                        alert('Upload failed: ' + (response.message || 'Unknown error'));
+                        document.getElementById('progressContainer').style.display = 'none';
+                    }
+                    
+                } catch (error) {
+                    alert('Upload error: ' + error.message);
+                    document.getElementById('progressContainer').style.display = 'none';
+                }
+                
+                // 清空文件选择
+                fileInput.value = '';
+            }
+        });
+    </script>
+</body>
+</html>
