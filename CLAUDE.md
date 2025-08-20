@@ -245,3 +245,4 @@ When contributing:
 - 如果需要执行sudo命令，你随时提醒我手动执行
 - 前端页面的访问地址是http://localhost:3000/
 - 不要使用绝对路径，一律使用环境变量文件，为了后期好维护
+- 不要动RAG-Anything/raganything/里面的文件，这是原生的代码

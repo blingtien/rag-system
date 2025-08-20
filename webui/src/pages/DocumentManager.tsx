@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react'
-import { Card, Typography, Upload, Row, Col, Tag, Table, Button, Progress, Space, message, Modal, Divider, Tooltip } from 'antd'
+import React, { useEffect, useState, useRef } from 'react'
+import { Card, Typography, Upload, Row, Col, Tag, Table, Button, Progress, Space, message, Modal, Divider, Tooltip, Layout } from 'antd'
 import * as Icons from '@ant-design/icons'
-const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined } = Icons
+const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined, ClearOutlined } = Icons
 import axios from 'axios'
 
 const { Title, Paragraph } = Typography
@@ -50,6 +50,9 @@ const DocumentManager: React.FC = () => {
   const [refreshing, setRefreshing] = useState(false)
   const [pendingFiles, setPendingFiles] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
+  const [processingLogs, setProcessingLogs] = useState<string[]>([])
+  const [ws, setWs] = useState<WebSocket | null>(null)
+  const logsEndRef = useRef<HTMLDivElement>(null)
 
   const supportedFormats = [
     { emoji: '📄', format: '.pdf', description: 'PDF文档' },
@@ -231,13 +234,65 @@ const DocumentManager: React.FC = () => {
     }
   }
 
+  // WebSocket连接管理
+  const connectWebSocket = () => {
+    // 如果已有连接，先关闭
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+      ws.close()
+    }
+    
+    const wsUrl = `ws://${window.location.host}/api/v1/documents/progress`
+    const websocket = new WebSocket(wsUrl)
+    
+    websocket.onopen = () => {
+      console.log('WebSocket连接已建立')
+      setWs(websocket)
+    }
+    
+    websocket.onmessage = (event) => {
+      const data = JSON.parse(event.data)
+      if (data.type === 'log') {
+        setProcessingLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${data.message}`])
+        // 自动滚动到底部
+        setTimeout(() => {
+          logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+        }, 100)
+      }
+    }
+    
+    websocket.onclose = (event) => {
+      console.log('WebSocket连接已关闭', event.code, event.reason)
+      setWs(null)
+      // 只有在非正常关闭时才自动重连
+      if (event.code !== 1000 && event.code !== 1001) {
+        setTimeout(connectWebSocket, 5000)
+      }
+    }
+    
+    websocket.onerror = (error) => {
+      console.error('WebSocket错误:', error)
+    }
+  }
+
+  // 清空日志
+  const clearLogs = () => {
+    setProcessingLogs([])
+  }
+
   // 组件挂载时加载数据
   useEffect(() => {
     refreshData()
+    connectWebSocket()
     // 设置定时刷新
     const interval = setInterval(refreshData, 10000) // 每10秒刷新一次
-    return () => clearInterval(interval)
-  }, [])
+    
+    return () => {
+      clearInterval(interval)
+      if (ws && ws.readyState !== WebSocket.CLOSED) {
+        ws.close(1000, 'Component unmounting') // 正常关闭
+      }
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 处理文件拖拽和选择（去重）
   const handleFilesChange = (files: File[]) => {
@@ -403,11 +458,12 @@ const DocumentManager: React.FC = () => {
 
   return (
     <div>
-      <div style={{ marginBottom: 32 }}>
+      {/* 页面标题 */}
+      <div style={{ marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <Title level={2}>文档管理</Title>
-            <Paragraph type="secondary">上传并处理各种格式的文档</Paragraph>
+            <Paragraph type="secondary">上传并处理各种格式的文档，实时查看解析过程</Paragraph>
           </div>
           <Space>
             <Button 
@@ -428,6 +484,159 @@ const DocumentManager: React.FC = () => {
         </div>
       </div>
 
+      {/* 上半部分：左侧上传区域 + 右侧解析日志 */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        {/* 左上角：文件上传区域 */}
+        <Col xs={24} lg={12}>
+          <Card 
+            title="文件上传" 
+            style={{ height: '400px' }}
+            bodyStyle={{ height: 'calc(100% - 56px)', display: 'flex', flexDirection: 'column' }}
+          >
+            {/* 待上传文件列表 */}
+            {pendingFiles.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ 
+                  display: 'flex', 
+                  justifyContent: 'space-between', 
+                  alignItems: 'center',
+                  marginBottom: 8
+                }}>
+                  <span style={{ fontWeight: 'bold' }}>待上传文件 ({pendingFiles.length})</span>
+                  <Space>
+                    <Button 
+                      size="small" 
+                      onClick={() => setPendingFiles([])}
+                    >
+                      清空
+                    </Button>
+                    <Button 
+                      type="primary" 
+                      size="small"
+                      loading={uploading}
+                      onClick={confirmUpload}
+                    >
+                      确认上传
+                    </Button>
+                  </Space>
+                </div>
+                <div style={{ 
+                  maxHeight: '120px', 
+                  overflowY: 'auto',
+                  border: '1px solid #f0f0f0',
+                  borderRadius: '6px',
+                  padding: '8px'
+                }}>
+                  {pendingFiles.map((file, index) => (
+                    <div key={index} style={{ 
+                      display: 'flex', 
+                      justifyContent: 'space-between', 
+                      alignItems: 'center',
+                      padding: '4px 0',
+                      borderBottom: index < pendingFiles.length - 1 ? '1px solid #f5f5f5' : 'none'
+                    }}>
+                      <Space size={4}>
+                        <span style={{ fontSize: '12px' }}>{file.name}</span>
+                        <Tag size="small" color="blue">{formatFileSize(file.size)}</Tag>
+                      </Space>
+                      <Button 
+                        size="small" 
+                        type="text" 
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => removePendingFile(index)}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 文件拖拽上传区域 */}
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+              <Dragger 
+                {...uploadProps} 
+                style={{ 
+                  flex: 1,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+              >
+                <div style={{ textAlign: 'center' }}>
+                  <p className="ant-upload-drag-icon">
+                    <InboxOutlined style={{ fontSize: 32, color: '#1890ff' }} />
+                  </p>
+                  <p className="ant-upload-text" style={{ fontSize: 14, marginBottom: 8 }}>
+                    拖拽文件到此处或点击选择
+                  </p>
+                  <p className="ant-upload-hint" style={{ color: '#666', fontSize: 12 }}>
+                    支持 PDF, Word, PPT, 图片等格式
+                  </p>
+                </div>
+              </Dragger>
+            </div>
+          </Card>
+        </Col>
+
+        {/* 右上角：实时解析日志 */}
+        <Col xs={24} lg={12}>
+          <Card 
+            title={
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>解析过程日志</span>
+                <Space>
+                  <span style={{ fontSize: '12px', color: '#666' }}>
+                    {processingLogs.length} 条日志
+                  </span>
+                  <Button 
+                    size="small" 
+                    icon={<ClearOutlined />}
+                    onClick={clearLogs}
+                    disabled={processingLogs.length === 0}
+                  >
+                    清空
+                  </Button>
+                </Space>
+              </div>
+            }
+            style={{ height: '400px' }}
+            bodyStyle={{ 
+              height: 'calc(100% - 56px)', 
+              padding: 0,
+              display: 'flex',
+              flexDirection: 'column'
+            }}
+          >
+            <div style={{
+              flex: 1,
+              overflowY: 'auto',
+              backgroundColor: '#000',
+              color: '#00ff00',
+              fontFamily: 'Monaco, Consolas, "Courier New", monospace',
+              fontSize: '11px',
+              lineHeight: '1.4',
+              padding: '8px 12px'
+            }}>
+              {processingLogs.length === 0 ? (
+                <div style={{ color: '#666', textAlign: 'center', paddingTop: '20px' }}>
+                  暂无解析日志，上传文档后开始解析即可查看详细过程
+                </div>
+              ) : (
+                <div>
+                  {processingLogs.map((log, index) => (
+                    <div key={index} style={{ marginBottom: '2px', wordBreak: 'break-all' }}>
+                      {log}
+                    </div>
+                  ))}
+                  <div ref={logsEndRef} />
+                </div>
+              )}
+            </div>
+          </Card>
+        </Col>
+      </Row>
+
       {/* 处理统计信息 */}
       {runningTasks.length > 0 && (
         <Card 
@@ -437,103 +646,11 @@ const DocumentManager: React.FC = () => {
           <Space>
             <Tag color="processing">正在处理 {runningTasks.length} 个文档</Tag>
             <span style={{ color: '#666' }}>
-              进度会在下方表格中实时更新
+              详细过程可在上方日志区域查看，进度会在下方表格中实时更新
             </span>
           </Space>
         </Card>
       )}
-
-      {/* 待上传文件列表 */}
-      {pendingFiles.length > 0 && (
-        <Card 
-          title="待上传文件" 
-          size="small" 
-          style={{ marginBottom: 24, backgroundColor: '#fff7e6', borderColor: '#ffd591' }}
-          extra={
-            <Space>
-              <Button 
-                size="small" 
-                onClick={() => setPendingFiles([])}
-              >
-                清空
-              </Button>
-              <Button 
-                type="primary" 
-                size="small"
-                loading={uploading}
-                onClick={confirmUpload}
-              >
-                确认上传 ({pendingFiles.length})
-              </Button>
-            </Space>
-          }
-        >
-          <div style={{ maxHeight: 150, overflowY: 'auto' }}>
-            {pendingFiles.map((file, index) => (
-              <div key={index} style={{ 
-                display: 'flex', 
-                justifyContent: 'space-between', 
-                alignItems: 'center',
-                padding: '8px 0',
-                borderBottom: index < pendingFiles.length - 1 ? '1px solid #f0f0f0' : 'none'
-              }}>
-                <Space>
-                  <span>{file.name}</span>
-                  <Tag color="blue">{formatFileSize(file.size)}</Tag>
-                </Space>
-                <Button 
-                  size="small" 
-                  type="text" 
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() => removePendingFile(index)}
-                />
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
-
-      {/* 文件上传区域 */}
-      <Card style={{ marginBottom: 24 }}>
-        <Dragger {...uploadProps} style={{ padding: '48px 24px' }}>
-          <p className="ant-upload-drag-icon">
-            <InboxOutlined style={{ fontSize: 48, color: '#1890ff' }} />
-          </p>
-          <p className="ant-upload-text" style={{ fontSize: 18, marginBottom: 16 }}>
-            拖拽文件到此处或点击选择文件
-          </p>
-          <p className="ant-upload-hint" style={{ color: '#666' }}>
-            支持多种文档格式，文件会先添加到待上传列表，需要确认后才会上传
-          </p>
-        </Dragger>
-        
-        {pendingFiles.length > 0 && (
-          <div style={{ 
-            marginTop: 16, 
-            padding: 16, 
-            backgroundColor: '#fafafa', 
-            borderRadius: 6,
-            textAlign: 'center'
-          }}>
-            <Space>
-              <span style={{ color: '#666' }}>
-                已选择 {pendingFiles.length} 个文件
-              </span>
-              <Button 
-                type="primary" 
-                loading={uploading}
-                onClick={confirmUpload}
-              >
-                确认上传
-              </Button>
-              <Button onClick={() => setPendingFiles([])}>
-                取消
-              </Button>
-            </Space>
-          </div>
-        )}
-      </Card>
 
       {/* 已处理文档列表 */}
       <Card 
@@ -565,24 +682,28 @@ const DocumentManager: React.FC = () => {
         />
       </Card>
 
-      <Divider />
+      <Divider style={{ margin: '24px 0' }} />
 
       {/* 支持的文件格式 */}
-      <Card title="支持的文件格式">
-        <Row gutter={[16, 16]}>
+      <Card title="支持的文件格式" size="small">
+        <Row gutter={[12, 12]}>
           {supportedFormats.map((format, index) => (
             <Col xs={12} sm={8} md={6} lg={4} xl={3} key={index}>
-              <Card
-                size="small"
-                style={{ textAlign: 'center', backgroundColor: '#fafafa' }}
-                bodyStyle={{ padding: 16 }}
+              <div
+                style={{ 
+                  textAlign: 'center', 
+                  backgroundColor: '#fafafa',
+                  padding: '12px',
+                  borderRadius: '6px',
+                  border: '1px solid #f0f0f0'
+                }}
               >
-                <div style={{ fontSize: 24, marginBottom: 8 }}>{format.emoji}</div>
+                <div style={{ fontSize: 20, marginBottom: 6 }}>{format.emoji}</div>
                 <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
-                  <Tag color="blue">{format.format}</Tag>
+                  <Tag size="small" color="blue">{format.format}</Tag>
                 </div>
-                <div style={{ fontSize: 12, color: '#666' }}>{format.description}</div>
-              </Card>
+                <div style={{ fontSize: 11, color: '#666' }}>{format.description}</div>
+              </div>
             </Col>
           ))}
         </Row>

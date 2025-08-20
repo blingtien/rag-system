@@ -42,9 +42,11 @@ from smart_parser_router import router
 from direct_text_processor import text_processor
 # 导入详细状态跟踪器
 from detailed_status_tracker import detailed_tracker, StatusLogger, ProcessingStage
+# 导入WebSocket日志处理器
+from websocket_log_handler import websocket_log_handler, setup_websocket_logging, get_log_summary, get_core_progress, clear_logs
 
 # 加载环境变量
-load_dotenv(dotenv_path="../.env", override=False)
+load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +67,12 @@ rag_instance: Optional[RAGAnything] = None
 tasks: Dict[str, dict] = {}
 documents: Dict[str, dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
+processing_log_websockets: List[WebSocket] = []  # 文档解析日志WebSocket连接列表
+
+# 日志显示模式
+class LogDisplayMode(BaseModel):
+    mode: str = "summary"  # core_only, summary, detailed, all
+    include_debug: bool = False
 
 # 配置 - 统一使用绝对路径，指向RAG-Anything根目录的存储
 UPLOAD_DIR = os.path.abspath("../../uploads")
@@ -266,6 +274,10 @@ async def initialize_rag():
 @app.on_event("startup")
 async def startup_event():
     """服务启动时初始化RAG系统"""
+    # 设置WebSocket日志处理器
+    setup_websocket_logging()
+    websocket_log_handler.set_event_loop(asyncio.get_event_loop())
+    
     await initialize_rag()
     await load_existing_documents()
 
@@ -568,9 +580,11 @@ async def process_text_file_direct(task_id: str, file_path: str):
         detailed_tracker.add_status_callback(task_id, lambda status: send_detailed_status_update(task_id, status))
         
         logger.info(f"开始直接处理文本文件: {file_path}")
+        await send_processing_log(f"📝 开始直接处理文本文件 (跳过PDF转换)", "info")
         
         # 开始解析阶段
         detailed_status.start_stage(ProcessingStage.PARSING, 1, "直接解析文本文件")
+        await send_processing_log(f"⚡ 使用优化路径直接解析文本内容...", "info")
         
         # 更新传统任务状态（保持兼容性）
         task["stage"] = "parsing"
@@ -585,6 +599,7 @@ async def process_text_file_direct(task_id: str, file_path: str):
         detailed_status.content_stats.update_from_content_list(content_list)
         detailed_status.complete_stage(ProcessingStage.PARSING)
         detailed_status.add_log("SUCCESS", f"解析完成！提取了 {len(content_list)} 个内容块")
+        await send_processing_log(f"✅ 文本解析完成！提取了 {len(content_list)} 个内容块", "success")
         
         # 更新传统任务状态
         task["stage_details"]["parsing"]["status"] = "completed"
@@ -593,6 +608,7 @@ async def process_text_file_direct(task_id: str, file_path: str):
         
         # 开始文本插入阶段
         detailed_status.start_stage(ProcessingStage.TEXT_PROCESSING, len(content_list), "插入文本内容到知识图谱")
+        await send_processing_log(f"📝 开始插入 {len(content_list)} 个内容块到知识图谱...", "info")
         
         task["stage"] = "text_insert"
         task["stage_details"]["text_insert"]["status"] = "running"
@@ -601,12 +617,14 @@ async def process_text_file_direct(task_id: str, file_path: str):
         
         # 调用RAG的内容插入方法
         doc_id = await rag.insert_content_list(content_list, file_path)
+        await send_processing_log(f"✅ 内容插入完成，文档ID: {doc_id[:12]}...", "success")
         
         # 完成文本处理
         detailed_status.complete_stage(ProcessingStage.TEXT_PROCESSING)
         
         # 开始知识图谱构建
         detailed_status.start_stage(ProcessingStage.GRAPH_BUILDING, 1, "构建知识图谱")
+        await send_processing_log(f"🕸️  开始构建知识图谱，提取实体和关系...", "info")
         
         # 快速完成其他阶段（文本文件无需图片、表格、公式处理）
         stages_to_complete = [
@@ -630,11 +648,16 @@ async def process_text_file_direct(task_id: str, file_path: str):
         
         # 完成知识图谱构建和索引
         detailed_status.complete_stage(ProcessingStage.GRAPH_BUILDING)
+        await send_processing_log(f"✅ 知识图谱构建完成", "success")
+        
         detailed_status.start_stage(ProcessingStage.INDEXING, 1, "创建搜索索引")
+        await send_processing_log(f"🗂️  创建搜索索引...", "info")
         detailed_status.complete_stage(ProcessingStage.INDEXING)
+        await send_processing_log(f"✅ 搜索索引创建完成", "success")
         
         # 完成整个处理过程
         detailed_status.complete_processing()
+        await send_processing_log(f"🎉 文本文件处理全部完成！", "success")
         
         # 完成处理
         task["status"] = "completed"
@@ -657,6 +680,7 @@ async def process_text_file_direct(task_id: str, file_path: str):
         logger.info(f"直接文本处理完成: {file_path}, {len(content_list)}个内容块")
     
     except Exception as e:
+        await send_processing_log(f"❌ 直接文本处理失败: {str(e)}", "error")
         logger.error(f"直接文本处理失败: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
@@ -668,12 +692,19 @@ async def process_text_file_direct(task_id: str, file_path: str):
         
         task["status"] = "failed"
         task["error_message"] = str(e)
+        task["completed_at"] = datetime.now().isoformat()  # 确保设置completed_at
         task["updated_at"] = datetime.now().isoformat()
         
         if task["document_id"] in documents:
             documents[task["document_id"]]["status"] = "failed"
             documents[task["document_id"]]["error_message"] = str(e)
             documents[task["document_id"]]["updated_at"] = datetime.now().isoformat()
+            # 计算处理时间（即使失败）
+            if "started_at" in task and "completed_at" in task:
+                documents[task["document_id"]]["processing_time"] = (
+                    datetime.fromisoformat(task["completed_at"]) - 
+                    datetime.fromisoformat(task["started_at"])
+                ).total_seconds()
     
     finally:
         # 清理状态跟踪
@@ -716,8 +747,15 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         
         logger.info(f"开始处理文档: {file_path}, 使用解析器: {parser_config.parser}")
         
+        # 发送开始处理日志
+        await send_processing_log(f"🚀 开始处理文档: {os.path.basename(file_path)}", "info")
+        await send_processing_log(f"📄 文件大小: {file_size/1024:.1f} KB", "info")
+        await send_processing_log(f"⚙️  解析器: {parser_config.parser} ({parser_config.reason})", "info")
+        await send_processing_log(f"🎯 解析方法: {parser_config.method}", "info")
+        
         # 开始解析阶段
         detailed_status.start_stage(ProcessingStage.PARSING, 1, f"使用{parser_config.parser}解析器处理文档")
+        await send_processing_log(f"🔧 开始文档解析阶段...", "info")
         
         # 更新传统任务状态
         task["stage"] = "parsing"
@@ -730,24 +768,115 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         rag.config.parser = parser_config.parser
         
         try:
-            # 调用RAGAnything处理文档，添加GPU设备配置
+            # 处理.doc文件的特殊情况：先转换为.docx再用Docling处理
+            actual_file_path = file_path
+            temp_converted_file = None
+            
+            if parser_config.parser == "docling" and Path(file_path).suffix.lower() == ".doc":
+                await send_processing_log(f"🔄 检测到.doc文件，使用LibreOffice转换为.docx...", "info")
+                
+                import tempfile
+                import subprocess
+                import platform
+                import shutil
+                
+                # 创建临时转换文件
+                temp_dir = Path(tempfile.mkdtemp())
+                file_stem = Path(file_path).stem
+                
+                try:
+                    # 使用LibreOffice转换.doc为.docx
+                    convert_cmd = [
+                        "libreoffice",
+                        "--headless", 
+                        "--convert-to",
+                        "docx",
+                        "--outdir",
+                        str(temp_dir),
+                        str(file_path)
+                    ]
+                    
+                    convert_subprocess_kwargs = {
+                        "capture_output": True,
+                        "text": True,
+                        "timeout": 60,
+                        "encoding": "utf-8",
+                        "errors": "ignore",
+                    }
+                    
+                    if platform.system() == "Windows":
+                        convert_subprocess_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    
+                    result = subprocess.run(convert_cmd, **convert_subprocess_kwargs)
+                    
+                    if result.returncode != 0:
+                        raise RuntimeError(f"LibreOffice转换失败: {result.stderr}")
+                    
+                    # 查找生成的.docx文件
+                    docx_files = list(temp_dir.glob("*.docx"))
+                    if not docx_files:
+                        raise RuntimeError("LibreOffice转换失败：未生成.docx文件")
+                    
+                    temp_docx_path = docx_files[0]
+                    
+                    # 复制转换后的文件到上传目录，保持原始文件名
+                    converted_file_path = Path(file_path).parent / f"{file_stem}_converted.docx"
+                    shutil.copy2(temp_docx_path, converted_file_path)
+                    
+                    actual_file_path = str(converted_file_path)
+                    temp_converted_file = converted_file_path
+                    
+                    await send_processing_log(f"✅ LibreOffice转换完成: {temp_docx_path.stat().st_size} bytes", "success")
+                    
+                except Exception as e:
+                    # 清理临时目录
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    raise RuntimeError(f"LibreOffice转换过程出错: {str(e)}")
+                finally:
+                    # 清理临时目录
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            # 调用RAGAnything处理文档（使用实际的文件路径）
+            await send_processing_log(f"🔄 调用RAG处理引擎开始解析文档...", "info")
+            device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+            await send_processing_log(f"🖥️  计算设备: {device_type.upper()}", "info")
+            
+            start_time = datetime.now()
             await rag.process_document_complete(
-                file_path=file_path, 
+                file_path=actual_file_path, 
                 output_dir=OUTPUT_DIR,
                 parse_method=parser_config.method,
-                device="cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu",
+                device=device_type,
                 lang="en"  # 使用英文语言配置，MinerU不支持"auto"
             )
             
+            # 清理转换的临时文件
+            if temp_converted_file and temp_converted_file.exists():
+                try:
+                    temp_converted_file.unlink()
+                    await send_processing_log(f"🧹 清理临时转换文件", "info")
+                except Exception:
+                    pass  # 忽略清理错误
+            
+            processing_time = (datetime.now() - start_time).total_seconds()
+            await send_processing_log(f"✅ 文档解析完成！总耗时: {processing_time:.2f}秒", "success")
+            
             # 尝试获取解析结果来更新内容统计
             try:
+                await send_processing_log(f"📊 分析解析结果，提取内容统计信息...", "info")
                 # 等待一小段时间确保文件写入完成
                 await asyncio.sleep(1)
                 
-                # 尝试从MinerU输出文件读取准确的内容统计
+                # 尝试从输出文件读取准确的内容统计（使用原始文件名）
                 content_stats = get_content_stats_from_output(file_path, OUTPUT_DIR)
                 
                 if content_stats:
+                    await send_processing_log(f"📈 内容统计完成: 总计{content_stats['total']}个内容块", "success")
+                    await send_processing_log(f"📝 文本块: {content_stats['text']}个", "info")
+                    await send_processing_log(f"🖼️  图片块: {content_stats['image']}个", "info")
+                    await send_processing_log(f"📊 表格块: {content_stats['table']}个", "info")
+                    await send_processing_log(f"🧮 公式块: {content_stats.get('equation', 0)}个", "info")
+                    
                     # 更新详细状态的内容统计
                     detailed_status.content_stats.total_blocks = content_stats['total']
                     detailed_status.content_stats.text_blocks = content_stats['text']
@@ -775,6 +904,7 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
                     # 通知详细状态更新
                     await send_detailed_status_update(task_id, detailed_status.to_dict())
                 else:
+                    await send_processing_log("⚠️  无法获取详细的内容统计信息", "warning")
                     detailed_status.add_log("WARNING", "无法获取详细的内容统计信息")
                                 
             except Exception as e:
@@ -790,20 +920,30 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
             rag.config.parser = original_parser
         
         # 开始后续处理阶段
+        await send_processing_log(f"🔍 开始内容分析阶段...", "info")
         detailed_status.start_stage(ProcessingStage.CONTENT_ANALYSIS, 1, "分析文档内容")
         detailed_status.complete_stage(ProcessingStage.CONTENT_ANALYSIS)
+        await send_processing_log(f"✅ 内容分析完成", "success")
         
+        await send_processing_log(f"📝 开始文本处理阶段...", "info")
         detailed_status.start_stage(ProcessingStage.TEXT_PROCESSING, 1, "处理文本内容")
         detailed_status.complete_stage(ProcessingStage.TEXT_PROCESSING)
+        await send_processing_log(f"✅ 文本处理完成", "success")
         
+        await send_processing_log(f"🕸️  开始构建知识图谱...", "info")
         detailed_status.start_stage(ProcessingStage.GRAPH_BUILDING, 1, "构建知识图谱")
+        await send_processing_log(f"🧠 提取实体和关系中...", "info")
         detailed_status.complete_stage(ProcessingStage.GRAPH_BUILDING)
+        await send_processing_log(f"✅ 知识图谱构建完成", "success")
         
+        await send_processing_log(f"🗂️  开始创建搜索索引...", "info")
         detailed_status.start_stage(ProcessingStage.INDEXING, 1, "创建搜索索引")
         detailed_status.complete_stage(ProcessingStage.INDEXING)
+        await send_processing_log(f"✅ 搜索索引创建完成", "success")
         
         # 完成整个处理过程
         detailed_status.complete_processing()
+        await send_processing_log(f"🎉 文档处理全部完成！文档已成功添加到知识库", "success")
         
         # 逐步更新处理进度（保持兼容性）
         stages_progress = [
@@ -854,6 +994,7 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         logger.info(f"文档处理完成: {file_path}, 解析器: {parser_config.parser}")
     
     except Exception as e:
+        await send_processing_log(f"❌ 文档处理失败: {str(e)}", "error")
         logger.error(f"文档处理失败: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
@@ -865,12 +1006,19 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         
         task["status"] = "failed"
         task["error_message"] = str(e)
+        task["completed_at"] = datetime.now().isoformat()  # 确保设置completed_at
         task["updated_at"] = datetime.now().isoformat()
         
         if task["document_id"] in documents:
             documents[task["document_id"]]["status"] = "failed"
             documents[task["document_id"]]["error_message"] = str(e)
             documents[task["document_id"]]["updated_at"] = datetime.now().isoformat()
+            # 计算处理时间（即使失败）
+            if "started_at" in task and "completed_at" in task:
+                documents[task["document_id"]]["processing_time"] = (
+                    datetime.fromisoformat(task["completed_at"]) - 
+                    datetime.fromisoformat(task["started_at"])
+                ).total_seconds()
     
     finally:
         # 清理状态跟踪
@@ -963,6 +1111,12 @@ async def send_websocket_update(task_id: str, task: dict):
             await active_websockets[task_id].send_text(json.dumps(task))
         except:
             active_websockets.pop(task_id, None)
+
+async def send_processing_log(message: str, level: str = "info"):
+    """禁用手动日志发送，避免与LightRAG日志系统重复"""
+    # 完全禁用手动日志发送，只使用LightRAG原生日志系统
+    # 这确保没有重复日志，所有日志都通过智能处理器统一处理
+    pass
 
 @app.post("/api/v1/documents/upload") 
 async def upload_document(file: UploadFile = File(...)):
@@ -1381,6 +1535,48 @@ async def list_documents():
         }
     }
 
+@app.get("/api/v1/logs/summary")
+async def get_log_summary_api(mode: str = "summary", include_debug: bool = False):
+    """获取日志摘要"""
+    try:
+        summary = get_log_summary(include_debug=include_debug)
+        return {
+            "success": True,
+            "data": summary
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"获取日志摘要失败: {str(e)}"}
+        )
+
+@app.get("/api/v1/logs/core")
+async def get_core_logs_api():
+    """获取核心进度日志"""
+    try:
+        core_logs = get_core_progress()
+        return {
+            "success": True,
+            "logs": core_logs
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"获取核心日志失败: {str(e)}"}
+        )
+
+@app.post("/api/v1/logs/clear")
+async def clear_processing_logs_api():
+    """清空处理日志"""
+    try:
+        clear_logs()
+        return {"success": True, "message": "日志已清空"}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"清空日志失败: {str(e)}"}
+        )
+
 @app.delete("/api/v1/documents")
 async def delete_documents(request: DocumentDeleteRequest):
     """删除文档 - 完整删除包括向量库和知识图谱中的相关内容"""
@@ -1582,13 +1778,44 @@ async def websocket_task_endpoint(websocket: WebSocket, task_id: str):
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                await websocket.ping()
+                continue
             except WebSocketDisconnect:
                 break
     except Exception as e:
         logger.error(f"WebSocket error for task {task_id}: {e}")
     finally:
         active_websockets.pop(task_id, None)
+
+@app.websocket("/api/v1/documents/progress")
+async def websocket_processing_logs(websocket: WebSocket):
+    """文档解析过程日志WebSocket端点 - 连接到LightRAG实时日志"""
+    # Check origin header for CORS compliance
+    origin = websocket.headers.get("origin")
+    logger.info(f"WebSocket connection attempt from origin: {origin}")
+    
+    # Accept all origins (similar to CORS middleware configuration)
+    await websocket.accept()
+    
+    # 只添加到智能日志处理器，避免重复
+    websocket_log_handler.add_websocket_client(websocket)
+    
+    try:
+        # 发送连接确认 - 通过新的日志系统
+        await send_processing_log("WebSocket连接已建立，准备接收LightRAG实时日志...", "info")
+        
+        # 保持连接
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                continue
+            except WebSocketDisconnect:
+                break
+    except Exception as e:
+        logger.error(f"处理日志WebSocket错误: {e}")
+    finally:
+        # 只从智能日志处理器中移除
+        websocket_log_handler.remove_websocket_client(websocket)
 
 if __name__ == "__main__":
     print("🚀 Starting RAG-Anything API Server with Smart Parser Routing & Manual Processing Control")

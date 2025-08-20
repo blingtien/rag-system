@@ -93,14 +93,24 @@ class SmartParserRouter:
         )
     
     def _route_office_file(self, file_path: str, file_size: int) -> ParserConfig:
-        """路由Office文件 - 一律使用Docling"""
+        """路由Office文件 - 根据格式选择解析器"""
         file_ext = Path(file_path).suffix.lower()
         
+        # .doc格式先用LibreOffice转换为.docx，然后用Docling解析
+        if file_ext == ".doc":
+            return ParserConfig(
+                parser="docling",
+                method="auto",
+                category="office", 
+                reason="DOC文档先用LibreOffice转换为DOCX，然后用Docling解析"
+            )
+        
+        # 其他Office文档(.docx, .pptx, .xlsx)直接用Docling解析
         return ParserConfig(
             parser="docling",
             method="auto", 
             category="office",
-            reason=f"Office文档({file_ext})统一使用Docling直接解析，无需LibreOffice转换"
+            reason=f"Office文档({file_ext})使用Docling直接解析"
         )
     
     def _route_image_file(self, file_path: str, file_size: int) -> ParserConfig:
