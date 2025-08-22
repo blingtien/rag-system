@@ -7,9 +7,9 @@ export const PERFORMANCE_CONFIG = {
   // 批量处理配置
   batch: {
     // 最大并发处理请求数（建议与后端MAX_CONCURRENT_PROCESSING保持一致）
-    maxConcurrentProcess: 3,
+    maxConcurrentProcess: 5,
     // 批处理分组大小
-    processChunkSize: 3,
+    processChunkSize: 5,
     // 请求重试次数
     maxRetries: 2,
     // 重试延迟（毫秒）

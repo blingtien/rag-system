@@ -47,6 +47,7 @@ from websocket_log_handler import websocket_log_handler, setup_websocket_logging
 
 # 加载环境变量
 load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)
+load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env.performance", override=True)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -657,6 +658,8 @@ async def process_text_file_direct(task_id: str, file_path: str):
         
         # 调用RAG的内容插入方法
         doc_id = await rag.insert_content_list(content_list, file_path)
+        if doc_id is None:
+            raise Exception("RAG内容插入失败：返回的文档ID为空")
         await send_processing_log(f"✅ 内容插入完成，文档ID: {doc_id[:12]}...", "success")
         
         # 完成文本处理
@@ -1138,6 +1141,11 @@ async def send_detailed_status_update(task_id: str, detailed_status: dict):
     """发送详细状态更新到WebSocket"""
     if task_id in active_websockets:
         try:
+            # 检查详细状态是否为空
+            if detailed_status is None:
+                logger.warning(f"详细状态为空，跳过WebSocket更新: {task_id}")
+                return
+            
             # 发送详细状态信息
             status_message = {
                 "type": "detailed_status",
@@ -1540,15 +1548,37 @@ async def process_documents_batch(request: BatchProcessRequest):
             
             # 使用semaphore控制并发执行
             async def controlled_processing():
-                async with semaphore:
-                    # 更新为processing状态
-                    document["status"] = "processing"
-                    task["status"] = "pending"
-                    await send_processing_log(f"🔥 开始处理文档: {document['file_name']}", "info")
-                    
-                    # 启动实际处理任务
-                    file_path = document["file_path"]
-                    await process_document_real(task_id, file_path)
+                try:
+                    async with semaphore:
+                        # 重新检查任务是否仍然存在（并发安全）
+                        if task_id not in tasks:
+                            logger.warning(f"任务已被删除，跳过处理: {task_id}")
+                            return
+                        
+                        # 更新为processing状态
+                        document["status"] = "processing"
+                        current_task = tasks[task_id]  # 获取当前任务引用
+                        current_task["status"] = "pending"
+                        await send_processing_log(f"🔥 开始处理文档: {document['file_name']}", "info")
+                        
+                        # 启动实际处理任务
+                        file_path = document["file_path"]
+                        await process_document_real(task_id, file_path)
+                        
+                        # 处理成功后的状态更新
+                        await send_processing_log(f"✅ 文档处理完成: {document['file_name']}", "info")
+                        
+                except Exception as e:
+                    # 确保错误时正确更新状态，再次检查任务存在性
+                    document["status"] = "failed"
+                    if task_id in tasks:
+                        current_task = tasks[task_id]
+                        current_task["status"] = "failed"
+                        current_task["error"] = str(e)
+                        current_task["updated_at"] = datetime.now().isoformat()
+                    await send_processing_log(f"❌ 文档处理失败: {document['file_name']} - {str(e)}", "error")
+                    logger.error(f"处理文档 {document['file_name']} 失败: {str(e)}")
+                    # semaphore在async with块结束时会自动释放
             
             # 启动受控制的处理任务
             asyncio.create_task(controlled_processing())
