@@ -68,6 +68,7 @@ tasks: Dict[str, dict] = {}
 documents: Dict[str, dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
 processing_log_websockets: List[WebSocket] = []  # 文档解析日志WebSocket连接列表
+batch_operations: Dict[str, dict] = {}  # 批量操作状态跟踪
 
 # 日志显示模式
 class LogDisplayMode(BaseModel):
@@ -92,6 +93,41 @@ class QueryRequest(BaseModel):
 
 class DocumentDeleteRequest(BaseModel):
     document_ids: List[str]
+
+# 批量处理相关数据模型
+class BatchUploadResponse(BaseModel):
+    success: bool
+    uploaded_count: int
+    failed_count: int
+    total_files: int
+    results: List[dict]
+    message: str
+
+class BatchProcessRequest(BaseModel):
+    document_ids: List[str]
+    parser: Optional[str] = None
+    parse_method: Optional[str] = None
+
+class BatchProcessResponse(BaseModel):
+    success: bool
+    started_count: int
+    failed_count: int
+    total_requested: int
+    results: List[dict]
+    batch_operation_id: str
+    message: str
+
+class BatchOperationStatus(BaseModel):
+    batch_operation_id: str
+    operation_type: str  # "upload" | "process"
+    status: str  # "running" | "completed" | "failed" | "cancelled"
+    total_items: int
+    completed_items: int
+    failed_items: int
+    progress: float
+    started_at: str
+    completed_at: Optional[str] = None
+    results: List[dict]
 
 # 模拟处理阶段
 PROCESSING_STAGES = [
@@ -556,6 +592,10 @@ async def process_text_file_direct(task_id: str, file_path: str):
     task["status"] = "running"
     task["started_at"] = datetime.now().isoformat()
     
+    # 初始化时间变量，确保在所有异常处理中都能访问
+    start_time = datetime.now()
+    processing_start_time = datetime.now()
+    
     # 更新文档状态
     if task["document_id"] in documents:
         documents[task["document_id"]]["status"] = "processing"
@@ -722,6 +762,10 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
     task["status"] = "running"
     task["started_at"] = datetime.now().isoformat()
     
+    # 初始化时间变量，确保在所有异常处理中都能访问
+    start_time = datetime.now()
+    processing_start_time = datetime.now()
+    
     # 更新文档状态
     if task["document_id"] in documents:
         documents[task["document_id"]]["status"] = "processing"
@@ -841,7 +885,8 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
             device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
             await send_processing_log(f"🖥️  计算设备: {device_type.upper()}", "info")
             
-            start_time = datetime.now()
+            # 更新处理开始时间
+            processing_start_time = datetime.now()
             await rag.process_document_complete(
                 file_path=actual_file_path, 
                 output_dir=OUTPUT_DIR,
@@ -858,7 +903,7 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
                 except Exception:
                     pass  # 忽略清理错误
             
-            processing_time = (datetime.now() - start_time).total_seconds()
+            processing_time = (datetime.now() - processing_start_time).total_seconds()
             await send_processing_log(f"✅ 文档解析完成！总耗时: {processing_time:.2f}秒", "success")
             
             # 尝试获取解析结果来更新内容统计
@@ -1121,6 +1166,14 @@ async def send_processing_log(message: str, level: str = "info"):
 @app.post("/api/v1/documents/upload") 
 async def upload_document(file: UploadFile = File(...)):
     """单文档上传端点 - 保持向后兼容"""
+    # 检查文件名重复
+    existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
+    if existing_docs:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"文件名 '{file.filename}' 已存在，请重命名后再上传"
+        )
+    
     task_id = str(uuid.uuid4())
     document_id = str(uuid.uuid4())
     
@@ -1192,6 +1245,177 @@ async def upload_document(file: UploadFile = File(...)):
         "status": "uploaded"
     }
 
+@app.post("/api/v1/documents/upload/batch", response_model=BatchUploadResponse)
+async def upload_documents_batch(files: List[UploadFile] = File(...)):
+    """批量文档上传端点"""
+    batch_operation_id = str(uuid.uuid4())
+    uploaded_count = 0
+    failed_count = 0
+    results = []
+    
+    # 创建批量操作状态跟踪
+    batch_operation = {
+        "batch_operation_id": batch_operation_id,
+        "operation_type": "upload",
+        "status": "running",
+        "total_items": len(files),
+        "completed_items": 0,
+        "failed_items": 0,
+        "progress": 0.0,
+        "started_at": datetime.now().isoformat(),
+        "results": []
+    }
+    batch_operations[batch_operation_id] = batch_operation
+    
+    logger.info(f"开始批量上传 {len(files)} 个文件")
+    await send_processing_log(f"📤 开始批量上传 {len(files)} 个文件", "info")
+    
+    # 支持的文件类型
+    supported_extensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.txt', '.md', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp']
+    
+    for i, file in enumerate(files):
+        file_result = {
+            "file_name": file.filename,
+            "file_size": 0,
+            "status": "failed",
+            "message": "",
+            "task_id": None,
+            "document_id": None
+        }
+        
+        try:
+            # 文件类型验证
+            file_extension = os.path.splitext(file.filename)[1].lower()
+            if file_extension not in supported_extensions:
+                file_result["message"] = f"不支持的文件类型: {file_extension}"
+                failed_count += 1
+                results.append(file_result)
+                batch_operation["failed_items"] += 1
+                continue
+            
+            # 检查文件大小（限制100MB）
+            content = await file.read()
+            file_size = len(content)
+            if file_size > 100 * 1024 * 1024:  # 100MB
+                file_result["message"] = "文件大小超过100MB限制"
+                failed_count += 1
+                results.append(file_result)
+                batch_operation["failed_items"] += 1
+                continue
+                
+            # 检查文件名重复
+            existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
+            if existing_docs:
+                file_result["message"] = "文件名重复，已跳过"
+                failed_count += 1
+                results.append(file_result)
+                batch_operation["failed_items"] += 1
+                continue
+            
+            # 保存文件
+            task_id = str(uuid.uuid4())
+            document_id = str(uuid.uuid4())
+            file_path = os.path.join(UPLOAD_DIR, file.filename)
+            
+            with open(file_path, "wb") as buffer:
+                buffer.write(content)
+            
+            # 获取实际文件大小
+            actual_file_size = os.path.getsize(file_path)
+            
+            # 创建任务记录
+            task = {
+                "task_id": task_id,
+                "status": "pending",
+                "stage": "parsing",
+                "progress": 0,
+                "file_path": file_path,
+                "file_name": file.filename,
+                "file_size": actual_file_size,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "document_id": document_id,
+                "batch_operation_id": batch_operation_id,
+                "total_stages": len(PROCESSING_STAGES),
+                "stage_details": {
+                    stage[0]: {
+                        "status": "pending",
+                        "progress": 0
+                    } for stage in PROCESSING_STAGES
+                },
+                "multimodal_stats": {
+                    "images_count": 0,
+                    "tables_count": 0,
+                    "equations_count": 0,
+                    "images_processed": 0,
+                    "tables_processed": 0,
+                    "equations_processed": 0,
+                    "processing_success_rate": 0.0,
+                    "text_chunks": 0,
+                    "knowledge_entities": 0,
+                    "knowledge_relationships": 0
+                }
+            }
+            
+            tasks[task_id] = task
+            
+            # 创建文档记录
+            document = {
+                "document_id": document_id,
+                "file_name": file.filename,
+                "file_path": file_path,
+                "file_size": actual_file_size,
+                "status": "uploaded",
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "task_id": task_id,
+                "batch_operation_id": batch_operation_id
+            }
+            
+            documents[document_id] = document
+            
+            # 成功结果
+            file_result.update({
+                "file_size": actual_file_size,
+                "status": "success",
+                "message": "上传成功",
+                "task_id": task_id,
+                "document_id": document_id
+            })
+            
+            uploaded_count += 1
+            batch_operation["completed_items"] += 1
+            results.append(file_result)
+            
+        except Exception as e:
+            file_result["message"] = f"上传失败: {str(e)}"
+            failed_count += 1
+            batch_operation["failed_items"] += 1
+            results.append(file_result)
+            logger.error(f"批量上传文件 {file.filename} 失败: {str(e)}")
+        
+        # 更新进度
+        batch_operation["progress"] = ((i + 1) / len(files)) * 100
+        await send_processing_log(f"📤 批量上传进度: {i + 1}/{len(files)} ({batch_operation['progress']:.1f}%)", "info")
+    
+    # 完成批量操作
+    batch_operation["status"] = "completed"
+    batch_operation["completed_at"] = datetime.now().isoformat()
+    batch_operation["results"] = results
+    
+    message = f"批量上传完成: {uploaded_count} 个成功, {failed_count} 个失败"
+    logger.info(message)
+    await send_processing_log(f"✅ {message}", "info")
+    
+    return BatchUploadResponse(
+        success=failed_count == 0,
+        uploaded_count=uploaded_count,
+        failed_count=failed_count,
+        total_files=len(files),
+        results=results,
+        message=message
+    )
+
 @app.post("/api/v1/documents/{document_id}/process")
 async def process_document_manually(document_id: str):
     """手动触发文档处理端点"""
@@ -1239,6 +1463,158 @@ async def process_document_manually(document_id: str):
     except Exception as e:
         logger.error(f"启动文档处理失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to start processing: {str(e)}")
+
+@app.post("/api/v1/documents/process/batch", response_model=BatchProcessResponse)
+async def process_documents_batch(request: BatchProcessRequest):
+    """批量文档处理端点"""
+    batch_operation_id = str(uuid.uuid4())
+    started_count = 0
+    failed_count = 0
+    results = []
+    
+    # 创建批量操作状态跟踪
+    batch_operation = {
+        "batch_operation_id": batch_operation_id,
+        "operation_type": "process",
+        "status": "running",
+        "total_items": len(request.document_ids),
+        "completed_items": 0,
+        "failed_items": 0,
+        "progress": 0.0,
+        "started_at": datetime.now().isoformat(),
+        "results": []
+    }
+    batch_operations[batch_operation_id] = batch_operation
+    
+    logger.info(f"开始批量处理 {len(request.document_ids)} 个文档")
+    await send_processing_log(f"⚡ 开始批量处理 {len(request.document_ids)} 个文档", "info")
+    
+    # 并发控制配置
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_single_document(document_id: str, index: int) -> dict:
+        """处理单个文档的异步函数"""
+        doc_result = {
+            "document_id": document_id,
+            "file_name": "unknown",
+            "status": "failed",
+            "message": "",
+            "task_id": None
+        }
+        
+        try:
+            # 检查文档是否存在
+            if document_id not in documents:
+                doc_result["message"] = "文档不存在"
+                return doc_result
+            
+            document = documents[document_id]
+            doc_result["file_name"] = document["file_name"]
+            
+            # 检查文档状态
+            if document["status"] != "uploaded":
+                doc_result["message"] = f"文档状态不允许处理: {document['status']}"
+                return doc_result
+            
+            # 检查任务是否存在
+            task_id = document.get("task_id")
+            if not task_id or task_id not in tasks:
+                doc_result["message"] = "处理任务不存在"
+                return doc_result
+            
+            # 先设置为queued状态，然后通过semaphore控制实际处理
+            document["status"] = "queued"
+            document["updated_at"] = datetime.now().isoformat()
+            
+            task = tasks[task_id]
+            task["status"] = "queued"
+            task["updated_at"] = datetime.now().isoformat()
+            task["batch_operation_id"] = batch_operation_id
+            
+            doc_result.update({
+                "status": "success",
+                "message": "文档已排队等待处理",
+                "task_id": task_id
+            })
+            
+            # 使用semaphore控制并发执行
+            async def controlled_processing():
+                async with semaphore:
+                    # 更新为processing状态
+                    document["status"] = "processing"
+                    task["status"] = "pending"
+                    await send_processing_log(f"🔥 开始处理文档: {document['file_name']}", "info")
+                    
+                    # 启动实际处理任务
+                    file_path = document["file_path"]
+                    await process_document_real(task_id, file_path)
+            
+            # 启动受控制的处理任务
+            asyncio.create_task(controlled_processing())
+            
+            return doc_result
+            
+        except Exception as e:
+            doc_result["message"] = f"启动处理失败: {str(e)}"
+            logger.error(f"批量处理文档 {document_id} 失败: {str(e)}")
+            return doc_result
+    
+    # 执行批量处理
+    processing_tasks = []
+    for i, document_id in enumerate(request.document_ids):
+        task = process_single_document(document_id, i)
+        processing_tasks.append(task)
+    
+    # 等待所有处理任务完成
+    processing_results = await asyncio.gather(*processing_tasks, return_exceptions=True)
+    
+    # 统计结果
+    for i, result in enumerate(processing_results):
+        if isinstance(result, Exception):
+            # 处理异常情况
+            doc_result = {
+                "document_id": request.document_ids[i],
+                "file_name": "unknown",
+                "status": "failed",
+                "message": f"处理异常: {str(result)}",
+                "task_id": None
+            }
+            failed_count += 1
+            batch_operation["failed_items"] += 1
+        else:
+            if result["status"] == "success":
+                started_count += 1
+                batch_operation["completed_items"] += 1
+            else:
+                failed_count += 1
+                batch_operation["failed_items"] += 1
+            doc_result = result
+        
+        results.append(doc_result)
+        
+        # 更新进度
+        batch_operation["progress"] = ((i + 1) / len(request.document_ids)) * 100
+        await send_processing_log(f"⚡ 批量处理进度: {i + 1}/{len(request.document_ids)} ({batch_operation['progress']:.1f}%)", "info")
+    
+    # 完成批量操作
+    batch_operation["status"] = "completed"
+    batch_operation["completed_at"] = datetime.now().isoformat()
+    batch_operation["results"] = results
+    
+    message = f"批量处理完成: {started_count} 个启动成功, {failed_count} 个失败"
+    logger.info(message)
+    await send_processing_log(f"✅ {message}", "info")
+    
+    return BatchProcessResponse(
+        success=failed_count == 0,
+        started_count=started_count,
+        failed_count=failed_count,
+        total_requested=len(request.document_ids),
+        results=results,
+        batch_operation_id=batch_operation_id,
+        message=message
+    )
 
 @app.post("/api/v1/query")
 async def query_documents(request: QueryRequest):
@@ -1817,18 +2193,63 @@ async def websocket_processing_logs(websocket: WebSocket):
         # 只从智能日志处理器中移除
         websocket_log_handler.remove_websocket_client(websocket)
 
+@app.get("/api/v1/batch-operations/{batch_operation_id}", response_model=BatchOperationStatus)
+async def get_batch_operation_status(batch_operation_id: str):
+    """获取批量操作状态"""
+    if batch_operation_id not in batch_operations:
+        raise HTTPException(status_code=404, detail="Batch operation not found")
+    
+    batch_operation = batch_operations[batch_operation_id]
+    
+    return BatchOperationStatus(
+        batch_operation_id=batch_operation["batch_operation_id"],
+        operation_type=batch_operation["operation_type"],
+        status=batch_operation["status"],
+        total_items=batch_operation["total_items"],
+        completed_items=batch_operation["completed_items"],
+        failed_items=batch_operation["failed_items"],
+        progress=batch_operation["progress"],
+        started_at=batch_operation["started_at"],
+        completed_at=batch_operation.get("completed_at"),
+        results=batch_operation.get("results", [])
+    )
+
+@app.get("/api/v1/batch-operations")
+async def list_batch_operations(limit: int = 50, status: Optional[str] = None):
+    """列出批量操作"""
+    operations = list(batch_operations.values())
+    
+    # 按状态过滤
+    if status:
+        operations = [op for op in operations if op["status"] == status]
+    
+    # 按开始时间倒序排序
+    operations.sort(key=lambda x: x["started_at"], reverse=True)
+    
+    # 限制返回数量
+    operations = operations[:limit]
+    
+    return {
+        "success": True,
+        "operations": operations,
+        "total": len(operations)
+    }
+
 if __name__ == "__main__":
-    print("🚀 Starting RAG-Anything API Server with Smart Parser Routing & Manual Processing Control")
+    print("🚀 Starting RAG-Anything API Server with Smart Parser Routing & Batch Processing Support")
     print("📋 Available endpoints:")
     print("   🔍 Health: http://127.0.0.1:8001/health")
     print("   📤 Upload: http://127.0.0.1:8001/api/v1/documents/upload") 
+    print("   📤 Batch Upload: http://127.0.0.1:8001/api/v1/documents/upload/batch")
     print("   ▶️  Manual Process: http://127.0.0.1:8001/api/v1/documents/{document_id}/process")
+    print("   ⚡ Batch Process: http://127.0.0.1:8001/api/v1/documents/process/batch")
     print("   📋 Tasks: http://127.0.0.1:8001/api/v1/tasks")
     print("   📊 Detailed Status: http://127.0.0.1:8001/api/v1/tasks/{task_id}/detailed-status")
     print("   📄 Docs: http://127.0.0.1:8001/api/v1/documents")
     print("   🔍 Query: http://127.0.0.1:8001/api/v1/query")
     print("   📊 System Status: http://127.0.0.1:8001/api/system/status")
     print("   📈 Parser Stats: http://127.0.0.1:8001/api/system/parser-stats")
+    print("   📋 Batch Operations: http://127.0.0.1:8001/api/v1/batch-operations")
     print("   🔌 WebSocket: ws://127.0.0.1:8001/ws/task/{task_id}")
     print()
     print("🧠 Smart Features:")
@@ -1841,4 +2262,4 @@ if __name__ == "__main__":
     print("   🎯 Manual processing control - upload without auto-processing")
     print()
     
-    uvicorn.run(app, host="127.0.0.1", port=8001, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="info")

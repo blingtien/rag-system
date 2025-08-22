@@ -1,13 +1,16 @@
-import React, { useEffect, useState, useRef } from 'react'
-import { Card, Typography, Upload, Row, Col, Tag, Table, Button, Progress, Space, message, Modal, Divider, Tooltip, Layout } from 'antd'
+import React, { useEffect, useState, useRef, useCallback } from 'react'
+import { Card, Typography, Upload, Row, Col, Tag, Table, Button, Progress, Space, message, Modal, Divider, Tooltip, Layout, Checkbox, Alert, Dropdown } from 'antd'
 import * as Icons from '@ant-design/icons'
-const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined, ClearOutlined } = Icons
-import axios from 'axios'
+const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined, ClearOutlined, FolderOpenOutlined, CheckSquareOutlined, MinusSquareOutlined, DownOutlined, PlaySquareOutlined } = Icons
+import axios, { AxiosError } from 'axios'
+import { batchProcessDocuments } from '../utils/batchProcessor'
+import { PERFORMANCE_CONFIG, PerformanceMonitor } from '../config/performance.config'
 
 const { Title, Paragraph } = Typography
 const { Dragger } = Upload
 const { confirm } = Modal
 
+// Types and Interfaces
 interface Document {
   document_id: string
   file_name: string
@@ -43,16 +46,66 @@ interface Task {
   }
 }
 
+interface PendingFile {
+  file: File
+  id: string
+  status: 'pending' | 'uploading' | 'uploaded' | 'error'
+  progress: number
+  error?: string
+  relativePath?: string // For folder uploads
+}
+
+interface UploadResponse {
+  success: boolean
+  message?: string
+  document_id?: string
+  task_id?: string
+}
+
+// Constants
+const MAX_CONCURRENT_UPLOADS = 5
+const MAX_BATCH_SELECTION = 50
+const MAX_LOG_ENTRIES = 300
+const WEBSOCKET_RECONNECT_DELAY = 5000
+const SUPPORTED_FILE_TYPES = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.txt', '.md', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp']
+
+// Utility function to check if file type is supported
+const isFileTypeSupported = (fileName: string): boolean => {
+  const extension = fileName.toLowerCase().substring(fileName.lastIndexOf('.'))
+  return SUPPORTED_FILE_TYPES.includes(extension)
+}
+
+// Generate unique file ID for deduplication
+const generateFileId = (file: File): string => {
+  return `${file.name}_${file.size}_${file.lastModified}`
+}
+
 const DocumentManager: React.FC = () => {
+  // State management
   const [documents, setDocuments] = useState<Document[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const [pendingFiles, setPendingFiles] = useState<File[]>([])
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   const [uploading, setUploading] = useState(false)
   const [processingLogs, setProcessingLogs] = useState<string[]>([])
-  const [ws, setWs] = useState<WebSocket | null>(null)
+  const [selectedDocuments, setSelectedDocuments] = useState<string[]>([])
+  const [dragOver, setDragOver] = useState(false)
+  const isDragEventRef = useRef(false)
+  
+  // Refs for cleanup and state management
+  const wsRef = useRef<WebSocket | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
+  const logIdsRef = useRef<Set<string>>(new Set())
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const isComponentMountedRef = useRef(true)
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
+  const lastRequestIdRef = useRef<number>(0)
+  
+  // File deduplication cache for performance
+  const fileHashCacheRef = useRef<Map<string, string>>(new Map())
 
   const supportedFormats = [
     { emoji: '📄', format: '.pdf', description: 'PDF文档' },
@@ -64,107 +117,282 @@ const DocumentManager: React.FC = () => {
     { emoji: '🖼️', format: '.png', description: '图片文件' },
   ]
 
-  // 获取文档列表
-  const fetchDocuments = async () => {
-    try {
-      const response = await axios.get('/api/v1/documents')
-      if (response.data.success) {
-        setDocuments(response.data.documents)
-      }
-    } catch (error) {
-      console.error('获取文档列表失败:', error)
-    }
-  }
-
-  // 获取任务列表
-  const fetchTasks = async () => {
-    try {
-      const response = await axios.get('/api/v1/tasks')
-      if (response.data.success) {
-        setTasks(response.data.tasks)
-      }
-    } catch (error) {
-      console.error('获取任务列表失败:', error)
-    }
-  }
-
-  // 刷新数据
-  const refreshData = async () => {
+  // Super simplified data refresh function
+  const refreshData = useCallback(async () => {
+    console.log('🔄 Starting refreshData...')
+    
     setRefreshing(true)
-    await Promise.all([fetchDocuments(), fetchTasks()])
-    setRefreshing(false)
-  }
-
-  // 启动文档解析
-  const startProcessing = async (documentId: string, fileName: string) => {
+    
     try {
-      message.loading(`正在启动解析：${fileName}`, 0)
+      console.log('📡 Fetching documents from API...')
+      const response = await axios.get('/api/v1/documents')
+      
+      console.log('📥 Raw API response:', response.data)
+      
+      if (response.data && response.data.success && Array.isArray(response.data.documents)) {
+        console.log(`✅ Successfully got ${response.data.documents.length} documents`)
+        setDocuments(response.data.documents)
+      } else {
+        console.log('❌ Invalid API response structure')
+        setDocuments([])
+      }
+    } catch (error) {
+      console.error('❌ API call failed:', error)
+      message.error('获取文档列表失败')
+      setDocuments([])
+    }
+    
+    // Get tasks (non-critical)
+    try {
+      const tasksResponse = await axios.get('/api/v1/tasks')
+      if (tasksResponse.data?.success && Array.isArray(tasksResponse.data.tasks)) {
+        setTasks(tasksResponse.data.tasks)
+      } else {
+        setTasks([])
+      }
+    } catch (error) {
+      console.log('Tasks API failed (non-critical):', error)
+      setTasks([])
+    }
+    
+    setRefreshing(false)
+  }, [])
+
+  // Enhanced document processing with better error handling
+  const startProcessing = async (documentId: string, fileName: string) => {
+    if (!documentId || !fileName) {
+      message.error('文档信息不完整，无法启动解析')
+      return
+    }
+    
+    const loadingKey = `processing-${documentId}`
+    
+    try {
+      message.loading({ content: `正在启动解析：${fileName}`, key: loadingKey, duration: 0 })
+      
       const response = await axios.post(`/api/v1/documents/${documentId}/process`)
       
-      message.destroy() // 清除loading消息
+      message.destroy(loadingKey)
       
-      if (response.data.success) {
+      if (response.data?.success) {
         message.success(`开始解析：${fileName}`)
-        refreshData() // 刷新状态
+        await refreshData()
       } else {
-        message.error('启动解析失败')
+        const errorMsg = response.data?.message || '启动解析失败'
+        message.error(errorMsg)
       }
     } catch (error) {
-      message.destroy()
-      message.error('启动解析失败')
+      message.destroy(loadingKey)
+      
+      const errorMessage = axios.isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : '启动解析失败'
+      
+      message.error(errorMessage)
       console.error('Processing error:', error)
     }
   }
+  
+  // Batch processing with parallel execution
+  const handleBatchProcessDocuments = async (documentIds: string[]) => {
+    if (documentIds.length === 0) {
+      message.warning('请先选择要解析的文档')
+      return
+    }
 
-  // 删除文档
+    if (documentIds.length > MAX_BATCH_SELECTION) {
+      message.error(`最多只能同时选择 ${MAX_BATCH_SELECTION} 个文档进行批量操作`)
+      return
+    }
+
+    const selectedDocs = documents.filter(doc => 
+      documentIds.includes(doc.document_id) && doc.can_process
+    )
+
+    if (selectedDocs.length === 0) {
+      message.warning('选中的文档中没有可解析的文档')
+      return
+    }
+
+    Modal.confirm({
+      title: '批量解析确认',
+      icon: <ExclamationCircleOutlined />,
+      content: (
+        <div>
+          <p>确定要解析选中的 {selectedDocs.length} 个文档吗？</p>
+          <p style={{ fontSize: '12px', color: '#666', marginTop: 8 }}>
+            将使用并行处理，最多同时处理 {PERFORMANCE_CONFIG.batch.maxConcurrentProcess} 个文档
+          </p>
+        </div>
+      ),
+      okText: '开始解析',
+      cancelText: '取消',
+      onOk: async () => {
+        const loadingKey = 'batch-processing'
+        message.loading({ content: '正在启动批量解析...', key: loadingKey, duration: 0 })
+
+        // 记录性能
+        PerformanceMonitor.startTimer('batch-process')
+
+        // 使用并行批处理
+        const validDocIds = selectedDocs.map(doc => doc.document_id)
+        const { successCount, failCount, errors } = await batchProcessDocuments(
+          validDocIds,
+          (completed, total) => {
+            // 更新进度
+            const progress = Math.round((completed / total) * 100)
+            message.loading({ 
+              content: `批量解析中... (${completed}/${total}) ${progress}%`, 
+              key: loadingKey, 
+              duration: 0 
+            })
+          }
+        )
+
+        // 记录性能结果
+        const duration = PerformanceMonitor.endTimer('batch-process')
+        console.log(`批量处理 ${selectedDocs.length} 个文档耗时: ${(duration / 1000).toFixed(2)}秒`)
+
+        message.destroy(loadingKey)
+
+        if (successCount > 0) {
+          message.success(`成功启动 ${successCount} 个文档的解析${failCount > 0 ? `，${failCount} 个失败` : ''}`)
+        }
+        
+        if (failCount > 0 && errors.length > 0) {
+          Modal.error({
+            title: '部分文档解析启动失败',
+            content: (
+              <div>
+                <p>失败的文档：</p>
+                <ul style={{ maxHeight: '200px', overflow: 'auto' }}>
+                  {errors.map((error, index) => (
+                    <li key={index} style={{ fontSize: '12px', color: '#ff4d4f' }}>
+                      {error}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ),
+            width: 600
+          })
+        }
+
+        setSelectedDocuments([])
+        await refreshData()
+      }
+    })
+  }
+  
+  // Batch delete with enhanced error handling
+  const batchDeleteDocuments = async (documentIds: string[]) => {
+    if (documentIds.length === 0) {
+      message.warning('请先选择要删除的文档')
+      return
+    }
+
+    if (documentIds.length > MAX_BATCH_SELECTION) {
+      message.error(`最多只能同时选择 ${MAX_BATCH_SELECTION} 个文档进行批量操作`)
+      return
+    }
+
+    const selectedDocs = documents.filter(doc => documentIds.includes(doc.document_id))
+
+    Modal.confirm({
+      title: '批量删除确认',
+      icon: <ExclamationCircleOutlined />,
+      content: `确定要删除选中的 ${selectedDocs.length} 个文档吗？此操作不可恢复！`,
+      okText: '删除',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const response = await axios.delete('/api/v1/documents', {
+            data: { document_ids: documentIds }
+          })
+          
+          if (response.data?.success) {
+            message.success(`成功删除 ${selectedDocs.length} 个文档`)
+            setSelectedDocuments([])
+            await refreshData()
+          } else {
+            message.error(response.data?.message || '批量删除失败')
+          }
+        } catch (error) {
+          const errorMessage = axios.isAxiosError(error)
+            ? error.response?.data?.message || error.message
+            : '批量删除失败'
+          message.error(errorMessage)
+        }
+      }
+    })
+  }
+
+  // Delete document with enhanced error handling
   const deleteDocument = (documentId: string, fileName: string) => {
-    confirm({
+    if (!documentId || !fileName) {
+      message.error('文档信息不完整，无法删除')
+      return
+    }
+
+    Modal.confirm({
       title: '确认删除',
       icon: <ExclamationCircleOutlined />,
       content: `确定要删除文档"${fileName}"吗？`,
       okText: '删除',
       okType: 'danger',
       cancelText: '取消',
-      async onOk() {
+      onOk: async () => {
         try {
           const response = await axios.delete('/api/v1/documents', {
             data: { document_ids: [documentId] }
           })
-          if (response.data.success) {
+          if (response.data?.success) {
             message.success('文档删除成功')
-            refreshData()
+            await refreshData()
+          } else {
+            message.error(response.data?.message || '删除失败')
           }
         } catch (error) {
-          message.error('删除失败')
+          const errorMessage = axios.isAxiosError(error)
+            ? error.response?.data?.message || error.message
+            : '删除失败'
+          message.error(errorMessage)
         }
       }
     })
   }
 
-  // 清空所有文档
+  // Clear all documents with confirmation
   const clearAllDocuments = () => {
-    confirm({
+    Modal.confirm({
       title: '确认清空',
       icon: <ExclamationCircleOutlined />,
       content: '确定要清空所有文档吗？此操作不可恢复！',
       okText: '清空',
       okType: 'danger',
       cancelText: '取消',
-      async onOk() {
+      onOk: async () => {
         try {
           const response = await axios.delete('/api/v1/documents/clear')
-          if (response.data.success) {
+          if (response.data?.success) {
             message.success('所有文档已清空')
-            refreshData()
+            setSelectedDocuments([])
+            await refreshData()
+          } else {
+            message.error(response.data?.message || '清空失败')
           }
         } catch (error) {
-          message.error('清空失败')
+          const errorMessage = axios.isAxiosError(error)
+            ? error.response?.data?.message || error.message
+            : '清空失败'
+          message.error(errorMessage)
         }
       }
     })
   }
 
-  // 格式化文件大小
+  // Format file size
   const formatFileSize = (bytes: number) => {
     if (bytes === 0) return '0 Bytes'
     const k = 1024
@@ -173,7 +401,7 @@ const DocumentManager: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
-  // 获取状态显示内容（包含进度信息）
+  // Get status display with enhanced task information
   const getStatusDisplay = (document: Document) => {
     const task = tasks.find(t => t.task_id === document.task_id)
     
@@ -213,6 +441,15 @@ const DocumentManager: React.FC = () => {
             )}
           </div>
         )
+      case 'queued':
+        return (
+          <div>
+            <Tag color="orange">排队等待</Tag>
+            <div style={{ fontSize: 12, color: '#ff7a00', marginTop: 4 }}>
+              正在等待处理资源释放
+            </div>
+          </div>
+        )
       case 'pending':
       case 'uploaded':
         return <Tag color="default">{document.status_display}</Tag>
@@ -234,123 +471,364 @@ const DocumentManager: React.FC = () => {
     }
   }
 
-  // WebSocket连接管理
-  const connectWebSocket = () => {
-    // 如果已有连接，先关闭
-    if (ws && ws.readyState !== WebSocket.CLOSED) {
-      ws.close()
+  // Efficient log deduplication hash function
+  const generateLogHash = useCallback((message: string, timestamp: number): string => {
+    let hash = 0
+    const str = `${timestamp}_${message}`
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i)
+      hash = ((hash << 5) - hash) + char
+      hash = hash & hash
+    }
+    return hash.toString(36)
+  }, [])
+
+  // Memory cleanup function with enhanced management
+  const cleanupMemory = useCallback(() => {
+    // Clean log deduplication set, keep only recent 300
+    if (logIdsRef.current.size > 800) {
+      const ids = Array.from(logIdsRef.current)
+      const toKeep = ids.slice(-300)
+      logIdsRef.current.clear()
+      toKeep.forEach(id => logIdsRef.current.add(id))
+    }
+    
+    // Clean file hash cache periodically
+    if (fileHashCacheRef.current.size > 500) {
+      fileHashCacheRef.current.clear()
+    }
+  }, [])
+
+  // Enhanced WebSocket connection management
+  const connectWebSocket = useCallback(() => {
+    if (!isComponentMountedRef.current) return
+    
+    // Clean up existing connections and reconnect timers
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+    
+    if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+      wsRef.current.close(1000, 'Creating new connection')
     }
     
     const wsUrl = `ws://${window.location.host}/api/v1/documents/progress`
     const websocket = new WebSocket(wsUrl)
     
+    wsRef.current = websocket
+    
     websocket.onopen = () => {
       console.log('WebSocket连接已建立')
-      setWs(websocket)
     }
     
     websocket.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      if (data.type === 'log') {
-        setProcessingLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${data.message}`])
-        // 自动滚动到底部
-        setTimeout(() => {
-          logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-        }, 100)
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'log' && isComponentMountedRef.current) {
+          const timestamp = data.timestamp || Date.now()
+          const logHash = generateLogHash(data.message, timestamp)
+          
+          if (!logIdsRef.current.has(logHash)) {
+            const logEntry = `[${new Date(timestamp).toLocaleTimeString()}] ${data.message}`
+            
+            logIdsRef.current.add(logHash)
+            
+            setProcessingLogs(prev => {
+              const newLogs = [...prev, logEntry]
+              return newLogs.length > MAX_LOG_ENTRIES ? newLogs.slice(-MAX_LOG_ENTRIES) : newLogs
+            })
+            
+            // Use requestAnimationFrame for smooth scrolling
+            requestAnimationFrame(() => {
+              if (logsEndRef.current && isComponentMountedRef.current) {
+                logsEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
+              }
+            })
+            
+            // Periodic memory cleanup
+            if (logIdsRef.current.size % 100 === 0) {
+              cleanupMemory()
+            }
+          }
+        }
+      } catch (error) {
+        console.error('解析WebSocket消息失败:', error)
       }
     }
     
     websocket.onclose = (event) => {
       console.log('WebSocket连接已关闭', event.code, event.reason)
-      setWs(null)
-      // 只有在非正常关闭时才自动重连
-      if (event.code !== 1000 && event.code !== 1001) {
-        setTimeout(connectWebSocket, 5000)
+      
+      if (wsRef.current === websocket) {
+        wsRef.current = null
+      }
+      
+      // Smart reconnection: only reconnect on abnormal closure
+      const shouldReconnect = (
+        event.code !== 1000 &&
+        event.code !== 1001 &&
+        event.code !== 1005 &&
+        isComponentMountedRef.current
+      )
+      
+      if (shouldReconnect) {
+        console.log(`WebSocket异常关闭，${WEBSOCKET_RECONNECT_DELAY/1000}秒后尝试重连...`)
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (isComponentMountedRef.current) {
+            connectWebSocket()
+          }
+        }, WEBSOCKET_RECONNECT_DELAY)
       }
     }
     
     websocket.onerror = (error) => {
       console.error('WebSocket错误:', error)
     }
-  }
+    
+    return websocket
+  }, [generateLogHash, cleanupMemory])
 
-  // 清空日志
-  const clearLogs = () => {
+  // Clear logs and memory
+  const clearLogs = useCallback(() => {
     setProcessingLogs([])
-  }
-
-  // 组件挂载时加载数据
-  useEffect(() => {
-    refreshData()
-    connectWebSocket()
-    // 设置定时刷新
-    const interval = setInterval(refreshData, 10000) // 每10秒刷新一次
-    
-    return () => {
-      clearInterval(interval)
-      if (ws && ws.readyState !== WebSocket.CLOSED) {
-        ws.close(1000, 'Component unmounting') // 正常关闭
-      }
+    logIdsRef.current.clear()
+    // Suggest garbage collection if available
+    if (window.gc) {
+      window.gc()
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
-  // 处理文件拖拽和选择（去重）
-  const handleFilesChange = (files: File[]) => {
-    setPendingFiles(prev => {
-      const newFiles = files.filter(newFile => 
-        !prev.some(existingFile => 
-          existingFile.name === newFile.name && 
-          existingFile.size === newFile.size &&
-          existingFile.lastModified === newFile.lastModified
-        )
-      )
-      return [...prev, ...newFiles]
-    })
-  }
-
-  // 移除待上传文件
-  const removePendingFile = (index: number) => {
-    setPendingFiles(prev => prev.filter((_, i) => i !== index))
-  }
-
-  // 确认上传文件（逐个上传）
-  const confirmUpload = async () => {
-    if (pendingFiles.length === 0) return
+  // Enhanced file deduplication check - now includes server-side documents
+  const isDuplicateFile = useCallback((newFile: File, existingFiles: PendingFile[]): boolean => {
+    const fileKey = `${newFile.name}_${newFile.size}_${newFile.lastModified}`
     
+    // Check cache first
+    if (fileHashCacheRef.current.has(fileKey)) {
+      return true
+    }
+    
+    // Check against pending files (local queue)
+    const isPendingDuplicate = existingFiles.some(existing => 
+      existing.file.name === newFile.name && 
+      existing.file.size === newFile.size &&
+      existing.file.lastModified === newFile.lastModified
+    )
+    
+    // Check against server-side documents (by file name)
+    const isServerDuplicate = documents.some(doc => 
+      doc.file_name === newFile.name
+    )
+    
+    const isDuplicate = isPendingDuplicate || isServerDuplicate
+    
+    if (isDuplicate) {
+      fileHashCacheRef.current.set(fileKey, 'duplicate')
+    }
+    
+    return isDuplicate
+  }, [documents])
+
+  // Enhanced file handling with folder support
+  const handleFilesChange = useCallback((files: File[]) => {
+    const newPendingFiles: PendingFile[] = []
+    let duplicateCount = 0
+    let unsupportedCount = 0
+
+    files.forEach(file => {
+      // Check file type support
+      if (!isFileTypeSupported(file.name)) {
+        unsupportedCount++
+        return
+      }
+
+      // Check for duplicates
+      if (!isDuplicateFile(file, pendingFiles) && !isDuplicateFile(file, newPendingFiles)) {
+        newPendingFiles.push({
+          file,
+          id: generateFileId(file),
+          status: 'pending',
+          progress: 0,
+          relativePath: (file as any).webkitRelativePath || file.name
+        })
+      } else {
+        duplicateCount++
+      }
+    })
+
+    // Show feedback messages
+    if (unsupportedCount > 0) {
+      message.warning(`已过滤 ${unsupportedCount} 个不支持的文件格式`)
+    }
+
+    if (duplicateCount > 0) {
+      message.warning(`已过滤 ${duplicateCount} 个重复文件（包括服务器已存在的文件）`)
+    }
+
+    if (newPendingFiles.length > 0) {
+      setPendingFiles(prev => [...prev, ...newPendingFiles])
+      message.success(`添加了 ${newPendingFiles.length} 个文件到上传队列`)
+    } else if (files.length > 0) {
+      message.warning('没有找到可以添加的新文件')
+    }
+  }, [pendingFiles, isDuplicateFile])
+
+  // Handle folder selection
+  const handleFolderSelect = useCallback(() => {
+    if (folderInputRef.current) {
+      folderInputRef.current.click()
+    }
+  }, [])
+
+  // Handle folder input change
+  const handleFolderInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    if (files.length > 0) {
+      message.info(`从文件夹中选择了 ${files.length} 个文件`)
+      handleFilesChange(files)
+    }
+    // Reset input value to allow selecting the same folder again
+    if (folderInputRef.current) {
+      folderInputRef.current.value = ''
+    }
+  }, [handleFilesChange])
+
+  // Remove pending file
+  const removePendingFile = useCallback((id: string) => {
+    setPendingFiles(prev => prev.filter(file => file.id !== id))
+  }, [])
+
+  // Enhanced upload with concurrent processing
+  const confirmUpload = async () => {
+    if (pendingFiles.length === 0) {
+      message.warning('没有待上传的文件')
+      return
+    }
+    
+    const filesToUpload = pendingFiles.filter(f => f.status === 'pending')
+    
+    if (filesToUpload.length === 0) {
+      message.warning('没有可上传的文件')
+      setUploading(false)
+      return
+    }
+
     setUploading(true)
     let successCount = 0
     let failCount = 0
+    const uploadErrors: string[] = []
 
     try {
-      for (const file of pendingFiles) {
-        const formData = new FormData()
-        formData.append('file', file)
+      // Process files in batches for better performance
+      for (let i = 0; i < filesToUpload.length; i += MAX_CONCURRENT_UPLOADS) {
+        const batch = filesToUpload.slice(i, i + MAX_CONCURRENT_UPLOADS)
+        
+        const batchPromises = batch.map(async (pendingFile) => {
+          try {
+            // Update file status to uploading
+            setPendingFiles(prev => prev.map(f => 
+              f.id === pendingFile.id ? { ...f, status: 'uploading' as const } : f
+            ))
 
-        try {
-          const response = await axios.post('/api/v1/documents/upload', formData, {
-            headers: { 'Content-Type': 'multipart/form-data' }
-          })
-          
-          if (response.data.success) {
-            successCount++
-          } else {
+            const formData = new FormData()
+            formData.append('file', pendingFile.file)
+
+            const response = await axios.post('/api/v1/documents/upload', formData, {
+              headers: { 'Content-Type': 'multipart/form-data' },
+              onUploadProgress: (progressEvent) => {
+                if (progressEvent.total) {
+                  const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total)
+                  setPendingFiles(prev => prev.map(f => 
+                    f.id === pendingFile.id ? { ...f, progress } : f
+                  ))
+                }
+              }
+            })
+            
+            if (response.data?.success) {
+              successCount++
+              setPendingFiles(prev => prev.map(f => 
+                f.id === pendingFile.id ? { ...f, status: 'uploaded' as const, progress: 100 } : f
+              ))
+            } else {
+              failCount++
+              const errorMsg = response.data?.message || '上传失败'
+              setPendingFiles(prev => prev.map(f => 
+                f.id === pendingFile.id ? { 
+                  ...f, 
+                  status: 'error' as const, 
+                  error: errorMsg 
+                } : f
+              ))
+              uploadErrors.push(`${pendingFile.file.name}: ${errorMsg}`)
+            }
+          } catch (error) {
             failCount++
+            let errorMessage = '上传失败'
+            
+            if (axios.isAxiosError(error)) {
+              if (error.response?.status === 400 && error.response?.data?.detail?.includes('已存在')) {
+                errorMessage = '文件名已存在'
+              } else {
+                errorMessage = error.response?.data?.detail || error.response?.data?.message || error.message
+              }
+            }
+            
+            setPendingFiles(prev => prev.map(f => 
+              f.id === pendingFile.id ? { 
+                ...f, 
+                status: 'error' as const, 
+                error: errorMessage 
+              } : f
+            ))
+            
+            uploadErrors.push(`${pendingFile.file.name}: ${errorMessage}`)
+            console.error(`Upload error for ${pendingFile.file.name}:`, error)
           }
-        } catch (error) {
-          failCount++
-          console.error(`Upload error for ${file.name}:`, error)
-        }
+        })
+
+        // Wait for current batch to complete before processing next batch
+        await Promise.all(batchPromises)
       }
 
+      // Show results
       if (successCount > 0) {
         message.success(`${successCount} 个文件上传成功${failCount > 0 ? `，${failCount} 个失败` : ''}`)
       }
-      if (failCount > 0 && successCount === 0) {
-        message.error(`${failCount} 个文件上传失败`)
+      
+      if (failCount > 0) {
+        if (successCount === 0) {
+          message.error(`${failCount} 个文件上传失败`)
+        }
+        
+        // Show detailed errors in modal
+        if (uploadErrors.length > 0) {
+          Modal.error({
+            title: '部分文件上传失败',
+            content: (
+              <div>
+                <p>失败的文件：</p>
+                <ul style={{ maxHeight: '200px', overflow: 'auto' }}>
+                  {uploadErrors.map((error, index) => (
+                    <li key={index} style={{ fontSize: '12px', color: '#ff4d4f' }}>
+                      {error}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ),
+            width: 600
+          })
+        }
       }
       
-      setPendingFiles([])
-      refreshData()
+      // Remove successfully uploaded files after a delay
+      setTimeout(() => {
+        setPendingFiles(prev => prev.filter(f => f.status !== 'uploaded'))
+      }, 2000)
+      
+      await refreshData()
+      
     } catch (error) {
       message.error('上传过程中发生错误')
       console.error('Upload process error:', error)
@@ -359,22 +837,114 @@ const DocumentManager: React.FC = () => {
     }
   }
 
+  // Batch selection related methods
+  const handleSelectAll = useCallback((checked: boolean) => {
+    if (checked) {
+      const selectableIds = documents
+        .filter(doc => doc.status_code !== 'processing')
+        .slice(0, MAX_BATCH_SELECTION)
+        .map(doc => doc.document_id)
+      setSelectedDocuments(selectableIds)
+      
+      if (documents.length > MAX_BATCH_SELECTION) {
+        message.info(`只选择了前 ${MAX_BATCH_SELECTION} 个文档`)
+      }
+    } else {
+      setSelectedDocuments([])
+    }
+  }, [documents])
+
+  const handleSelectDocument = useCallback((documentId: string, checked: boolean) => {
+    setSelectedDocuments(prev => {
+      if (checked) {
+        if (prev.length >= MAX_BATCH_SELECTION) {
+          message.warning(`最多只能选择 ${MAX_BATCH_SELECTION} 个文档`)
+          return prev
+        }
+        return [...prev, documentId]
+      } else {
+        return prev.filter(id => id !== documentId)
+      }
+    })
+  }, [])
+
+  // Drag and drop handlers
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setDragOver(true)
+    isDragEventRef.current = true
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setDragOver(false)
+  }, [])
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+  }, [])
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setDragOver(false)
+    
+    const files = Array.from(e.dataTransfer.files) as File[]
+    handleFilesChange(files)
+    
+    // Reset drag event flag after a longer delay to ensure upload component doesn't interfere
+    setTimeout(() => {
+      isDragEventRef.current = false
+    }, 500)
+  }, [handleFilesChange])
+
+  // Enhanced upload props with better error handling
   const uploadProps = {
     name: 'file',
     multiple: true,
+    directory: true, // Enable folder upload
     beforeUpload: (file: File) => {
+      // Skip processing if this is from a drag event to avoid duplication
+      if (isDragEventRef.current) {
+        return false
+      }
+      
+      // Handle file selection (click/browse events only)
       handleFilesChange([file])
-      return false // 阻止自动上传
-    },
-    onDrop(e: any) {
-      const files = Array.from(e.dataTransfer.files) as File[]
-      handleFilesChange(files)
+      return false // Prevent automatic upload
     },
     showUploadList: false,
+    accept: SUPPORTED_FILE_TYPES.join(',')
+    // onDrop is handled by the container div to avoid duplication
   }
 
-  // 文档表格列定义
+  // Check selection states
+  const selectableDocuments = documents.filter(doc => doc.status_code !== 'processing')
+  const isAllSelected = selectableDocuments.length > 0 && selectedDocuments.length === Math.min(selectableDocuments.length, MAX_BATCH_SELECTION)
+  const isIndeterminate = selectedDocuments.length > 0 && selectedDocuments.length < Math.min(selectableDocuments.length, MAX_BATCH_SELECTION)
+
+  // Enhanced document table columns with batch selection
   const documentColumns = [
+    {
+      title: (
+        <Checkbox
+          indeterminate={isIndeterminate}
+          onChange={(e) => handleSelectAll(e.target.checked)}
+          checked={isAllSelected}
+        >
+          全选
+        </Checkbox>
+      ),
+      dataIndex: 'selection',
+      key: 'selection',
+      width: 80,
+      render: (_: any, record: Document) => (
+        <Checkbox
+          checked={selectedDocuments.includes(record.document_id)}
+          onChange={(e) => handleSelectDocument(record.document_id, e.target.checked)}
+          disabled={record.status_code === 'processing'}
+        />
+      ),
+    },
     {
       title: '文件名',
       dataIndex: 'file_name',
@@ -453,17 +1023,104 @@ const DocumentManager: React.FC = () => {
     },
   ]
 
-  // 筛选正在运行的任务（用于统计显示）
+  // Batch operation menu items
+  const batchOperationMenuItems = [
+    {
+      key: 'batch-process',
+      label: '批量解析',
+      icon: <PlaySquareOutlined />,
+      disabled: selectedDocuments.length === 0
+    },
+    {
+      key: 'batch-delete',
+      label: '批量删除',
+      icon: <DeleteOutlined />,
+      disabled: selectedDocuments.length === 0
+    }
+  ]
+
+  const handleBatchMenuClick = ({ key }: { key: string }) => {
+    switch (key) {
+      case 'batch-process':
+        handleBatchProcessDocuments(selectedDocuments)
+        break
+      case 'batch-delete':
+        batchDeleteDocuments(selectedDocuments)
+        break
+    }
+  }
+
+  // Filter running tasks for statistics
   const runningTasks = tasks.filter(task => task.status === 'running')
+
+  // Simplified component mount effect
+  useEffect(() => {
+    console.log('🚀 DocumentManager component mounting')
+    isComponentMountedRef.current = true
+    
+    // Initial data load
+    refreshData()
+    connectWebSocket()
+    
+    return () => {
+      console.log('🔄 DocumentManager component unmounting')
+      isComponentMountedRef.current = false
+      
+      // Clean up timers
+      if (pollIntervalRef.current) {
+        clearTimeout(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+      
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      
+      // Clean up WebSocket
+      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+        wsRef.current.close(1000, 'Component unmounting')
+      }
+      wsRef.current = null
+      
+      // Clean up memory
+      logIdsRef.current.clear()
+      fileHashCacheRef.current.clear()
+    }
+  }, []) // Empty dependency array to run only once on mount
+
+  // Debug effect to track documents state changes
+  useEffect(() => {
+    console.log('📊 Documents state changed:', {
+      count: documents.length,
+      documents: documents.map(d => ({ id: d.document_id, name: d.file_name, status: d.status_code }))
+    })
+  }, [documents])
+
+  // Debug effect to track loading state changes  
+  useEffect(() => {
+    console.log('⏳ Loading states:', { loading, refreshing })
+  }, [loading, refreshing])
 
   return (
     <div>
-      {/* 页面标题 */}
+      {/* Hidden folder input */}
+      <input
+        ref={folderInputRef}
+        type="file"
+        webkitdirectory="true"
+        multiple
+        style={{ display: 'none' }}
+        onChange={handleFolderInputChange}
+        accept={SUPPORTED_FILE_TYPES.join(',')}
+      />
+
+      {/* Page title */}
       <div style={{ marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <Title level={2}>文档管理</Title>
-            <Paragraph type="secondary">上传并处理各种格式的文档，实时查看解析过程</Paragraph>
+            <Paragraph type="secondary">上传并处理各种格式的文档，支持批量操作和文件夹上传，实时查看解析过程</Paragraph>
           </div>
           <Space>
             <Button 
@@ -471,7 +1128,7 @@ const DocumentManager: React.FC = () => {
               loading={refreshing}
               onClick={refreshData}
             >
-              刷新
+              刷新 (调试: {documents.length} 文档)
             </Button>
             <Button 
               danger 
@@ -484,16 +1141,27 @@ const DocumentManager: React.FC = () => {
         </div>
       </div>
 
-      {/* 上半部分：左侧上传区域 + 右侧解析日志 */}
+      {/* Upper section: Upload area + Processing logs */}
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
-        {/* 左上角：文件上传区域 */}
+        {/* Left: File upload area */}
         <Col xs={24} lg={12}>
           <Card 
-            title="文件上传" 
+            title={
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>文件上传</span>
+                <Button
+                  icon={<FolderOpenOutlined />}
+                  size="small"
+                  onClick={handleFolderSelect}
+                >
+                  选择文件夹
+                </Button>
+              </div>
+            }
             style={{ height: '400px' }}
             bodyStyle={{ height: 'calc(100% - 56px)', display: 'flex', flexDirection: 'column' }}
           >
-            {/* 待上传文件列表 */}
+            {/* Pending files list */}
             {pendingFiles.length > 0 && (
               <div style={{ marginBottom: 16 }}>
                 <div style={{ 
@@ -502,11 +1170,19 @@ const DocumentManager: React.FC = () => {
                   alignItems: 'center',
                   marginBottom: 8
                 }}>
-                  <span style={{ fontWeight: 'bold' }}>待上传文件 ({pendingFiles.length})</span>
+                  <span style={{ fontWeight: 'bold' }}>
+                    待上传文件 ({pendingFiles.length})
+                    {pendingFiles.length > MAX_CONCURRENT_UPLOADS && (
+                      <Tag size="small" color="orange" style={{ marginLeft: 8 }}>
+                        将分批上传
+                      </Tag>
+                    )}
+                  </span>
                   <Space>
                     <Button 
                       size="small" 
                       onClick={() => setPendingFiles([])}
+                      disabled={uploading}
                     >
                       清空
                     </Button>
@@ -515,6 +1191,7 @@ const DocumentManager: React.FC = () => {
                       size="small"
                       loading={uploading}
                       onClick={confirmUpload}
+                      disabled={pendingFiles.filter(f => f.status === 'pending').length === 0}
                     >
                       确认上传
                     </Button>
@@ -527,24 +1204,52 @@ const DocumentManager: React.FC = () => {
                   borderRadius: '6px',
                   padding: '8px'
                 }}>
-                  {pendingFiles.map((file, index) => (
-                    <div key={index} style={{ 
+                  {pendingFiles.map((pendingFile) => (
+                    <div key={pendingFile.id} style={{ 
                       display: 'flex', 
                       justifyContent: 'space-between', 
                       alignItems: 'center',
                       padding: '4px 0',
-                      borderBottom: index < pendingFiles.length - 1 ? '1px solid #f5f5f5' : 'none'
+                      borderBottom: '1px solid #f5f5f5'
                     }}>
-                      <Space size={4}>
-                        <span style={{ fontSize: '12px' }}>{file.name}</span>
-                        <Tag size="small" color="blue">{formatFileSize(file.size)}</Tag>
-                      </Space>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 2 }}>
+                          <span style={{ 
+                            fontSize: '12px', 
+                            flex: 1, 
+                            overflow: 'hidden', 
+                            textOverflow: 'ellipsis', 
+                            whiteSpace: 'nowrap',
+                            marginRight: 8
+                          }}>
+                            {pendingFile.relativePath || pendingFile.file.name}
+                          </span>
+                          <Tag size="small" color="blue">{formatFileSize(pendingFile.file.size)}</Tag>
+                        </div>
+                        {pendingFile.status === 'uploading' && (
+                          <Progress 
+                            percent={pendingFile.progress} 
+                            size="small" 
+                            showInfo={false}
+                            status="active"
+                          />
+                        )}
+                        {pendingFile.status === 'uploaded' && (
+                          <Tag color="success" size="small">上传成功</Tag>
+                        )}
+                        {pendingFile.status === 'error' && (
+                          <Tooltip title={pendingFile.error}>
+                            <Tag color="error" size="small">上传失败</Tag>
+                          </Tooltip>
+                        )}
+                      </div>
                       <Button 
                         size="small" 
                         type="text" 
                         danger
                         icon={<DeleteOutlined />}
-                        onClick={() => removePendingFile(index)}
+                        onClick={() => removePendingFile(pendingFile.id)}
+                        disabled={pendingFile.status === 'uploading'}
                       />
                     </div>
                   ))}
@@ -552,34 +1257,51 @@ const DocumentManager: React.FC = () => {
               </div>
             )}
 
-            {/* 文件拖拽上传区域 */}
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+            {/* File drag upload area */}
+            <div 
+              style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
+            >
               <Dragger 
                 {...uploadProps} 
                 style={{ 
                   flex: 1,
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center'
+                  justifyContent: 'center',
+                  border: dragOver ? '2px dashed #1890ff' : '2px dashed #d9d9d9',
+                  backgroundColor: dragOver ? '#f0f8ff' : undefined,
+                  transition: 'all 0.3s'
                 }}
               >
                 <div style={{ textAlign: 'center' }}>
                   <p className="ant-upload-drag-icon">
-                    <InboxOutlined style={{ fontSize: 32, color: '#1890ff' }} />
+                    <InboxOutlined style={{ 
+                      fontSize: 32, 
+                      color: dragOver ? '#1890ff' : '#1890ff' 
+                    }} />
                   </p>
                   <p className="ant-upload-text" style={{ fontSize: 14, marginBottom: 8 }}>
-                    拖拽文件到此处或点击选择
+                    拖拽文件或文件夹到此处，或点击选择
                   </p>
                   <p className="ant-upload-hint" style={{ color: '#666', fontSize: 12 }}>
-                    支持 PDF, Word, PPT, 图片等格式
+                    支持 PDF, Word, PPT, 图片等格式，支持批量和文件夹上传
                   </p>
+                  {dragOver && (
+                    <p style={{ color: '#1890ff', fontSize: 12, marginTop: 8 }}>
+                      松开鼠标开始上传
+                    </p>
+                  )}
                 </div>
               </Dragger>
             </div>
           </Card>
         </Col>
 
-        {/* 右上角：实时解析日志 */}
+        {/* Right: Real-time processing logs */}
         <Col xs={24} lg={12}>
           <Card 
             title={
@@ -637,7 +1359,7 @@ const DocumentManager: React.FC = () => {
         </Col>
       </Row>
 
-      {/* 处理统计信息 */}
+      {/* Processing statistics */}
       {runningTasks.length > 0 && (
         <Card 
           size="small" 
@@ -652,12 +1374,61 @@ const DocumentManager: React.FC = () => {
         </Card>
       )}
 
-      {/* 已处理文档列表 */}
+      {/* Batch operation alert */}
+      {selectedDocuments.length > 0 && (
+        <Alert
+          message={`已选择 ${selectedDocuments.length} 个文档`}
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          action={
+            <Space>
+              <Button
+                size="small"
+                type="primary"
+                icon={<PlaySquareOutlined />}
+                onClick={() => handleBatchProcessDocuments(selectedDocuments)}
+              >
+                批量解析
+              </Button>
+              <Button
+                size="small"
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => batchDeleteDocuments(selectedDocuments)}
+              >
+                批量删除
+              </Button>
+              <Button
+                size="small"
+                onClick={() => setSelectedDocuments([])}
+              >
+                取消选择
+              </Button>
+            </Space>
+          }
+        />
+      )}
+
+      {/* Document list */}
       <Card 
         title={
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span>已处理文档 ({documents.length})</span>
             <Space>
+              {selectedDocuments.length > 0 && (
+                <Dropdown
+                  menu={{ 
+                    items: batchOperationMenuItems,
+                    onClick: handleBatchMenuClick
+                  }}
+                  trigger={['click']}
+                >
+                  <Button icon={<DownOutlined />}>
+                    批量操作
+                  </Button>
+                </Dropdown>
+              )}
               <span style={{ fontSize: 14, fontWeight: 'normal', color: '#666' }}>
                 共 {documents.length} 个文档
               </span>
@@ -677,14 +1448,16 @@ const DocumentManager: React.FC = () => {
             showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条，共 ${total} 条`,
           }}
           locale={{
-            emptyText: '暂无文档数据'
+            emptyText: `暂无文档数据 (调试: documents数组长度=${documents.length}, refreshing=${refreshing})`
           }}
+          scroll={{ x: true }}
+          loading={refreshing}
         />
       </Card>
 
       <Divider style={{ margin: '24px 0' }} />
 
-      {/* 支持的文件格式 */}
+      {/* Supported file formats */}
       <Card title="支持的文件格式" size="small">
         <Row gutter={[12, 12]}>
           {supportedFormats.map((format, index) => (
