@@ -234,24 +234,31 @@ const DocumentManager: React.FC = () => {
         // 记录性能
         PerformanceMonitor.startTimer('batch-process')
 
-        // 使用并行批处理
+        // 使用后端专用的批量处理API
         const validDocIds = selectedDocs.map(doc => doc.document_id)
-        const { successCount, failCount, errors } = await batchProcessDocuments(
+        const { successCount, failCount, errors, batchOperationId } = await batchProcessDocuments(
           validDocIds,
           (completed, total) => {
-            // 更新进度
+            // 更新进度 - 现在表示批量启动的进度
             const progress = Math.round((completed / total) * 100)
             message.loading({ 
-              content: `批量解析中... (${completed}/${total}) ${progress}%`, 
+              content: `正在启动批量解析... (${completed}/${total}) ${progress}%`, 
               key: loadingKey, 
               duration: 0 
             })
-          }
+          },
+          undefined, // parser: 使用默认解析器
+          undefined  // parseMethod: 使用默认方法
         )
 
         // 记录性能结果
         const duration = PerformanceMonitor.endTimer('batch-process')
         console.log(`批量处理 ${selectedDocs.length} 个文档耗时: ${(duration / 1000).toFixed(2)}秒`)
+        
+        // 记录批量操作ID用于可能的后续跟踪
+        if (batchOperationId) {
+          console.log(`批量操作ID: ${batchOperationId}`)
+        }
 
         message.destroy(loadingKey)
 

@@ -448,9 +448,9 @@ class ProcessorMixin:
             existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
             if existing_doc_status:
                 # Check if multimodal content is already processed
-                multimodal_processed = existing_doc_status.get(
-                    "multimodal_processed", False
-                )
+                # Read multimodal_processed from metadata to avoid DocProcessingStatus parameter error
+                metadata = existing_doc_status.get("metadata", {})
+                multimodal_processed = metadata.get("multimodal_processed", False)
 
                 if multimodal_processed:
                     self.logger.info(
@@ -1178,11 +1178,15 @@ class ProcessorMixin:
         try:
             current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
             if current_doc_status:
+                # Store multimodal_processed flag in metadata to avoid DocProcessingStatus parameter error
+                metadata = current_doc_status.get("metadata", {})
+                metadata["multimodal_processed"] = True
+                
                 await self.lightrag.doc_status.upsert(
                     {
                         doc_id: {
                             **current_doc_status,
-                            "multimodal_processed": True,
+                            "metadata": metadata,
                             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                         }
                     }
@@ -1212,7 +1216,9 @@ class ProcessorMixin:
                 return False
 
             text_processed = doc_status.get("status") == "PROCESSED"
-            multimodal_processed = doc_status.get("multimodal_processed", False)
+            # Read multimodal_processed from metadata to avoid DocProcessingStatus parameter error
+            metadata = doc_status.get("metadata", {})
+            multimodal_processed = metadata.get("multimodal_processed", False)
 
             return text_processed and multimodal_processed
 
@@ -1244,7 +1250,9 @@ class ProcessorMixin:
                 }
 
             text_processed = doc_status.get("status") == "PROCESSED"
-            multimodal_processed = doc_status.get("multimodal_processed", False)
+            # Read multimodal_processed from metadata to avoid DocProcessingStatus parameter error
+            metadata = doc_status.get("metadata", {})
+            multimodal_processed = metadata.get("multimodal_processed", False)
             fully_processed = text_processed and multimodal_processed
 
             return {

@@ -44,6 +44,12 @@ from direct_text_processor import text_processor
 from detailed_status_tracker import detailed_tracker, StatusLogger, ProcessingStage
 # 导入WebSocket日志处理器
 from websocket_log_handler import websocket_log_handler, setup_websocket_logging, get_log_summary, get_core_progress, clear_logs
+# 导入缓存增强处理器和统计跟踪
+from cache_enhanced_processor import CacheEnhancedProcessor
+from cache_statistics import initialize_cache_tracking, get_cache_stats_tracker
+# 导入增强的错误处理和进度跟踪
+from enhanced_error_handler import enhanced_error_handler
+from advanced_progress_tracker import advanced_progress_tracker
 
 # 加载环境变量
 load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)
@@ -65,6 +71,7 @@ app.add_middleware(
 
 # 全局变量
 rag_instance: Optional[RAGAnything] = None
+cache_enhanced_processor: Optional[CacheEnhancedProcessor] = None
 tasks: Dict[str, dict] = {}
 documents: Dict[str, dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
@@ -117,6 +124,7 @@ class BatchProcessResponse(BaseModel):
     results: List[dict]
     batch_operation_id: str
     message: str
+    cache_performance: Optional[dict] = None
 
 class BatchOperationStatus(BaseModel):
     batch_operation_id: str
@@ -142,13 +150,45 @@ PROCESSING_STAGES = [
     ("indexing", "创建索引", 10),
 ]
 
+def save_documents_state():
+    """保存文档和任务状态到磁盘"""
+    try:
+        state_file = os.path.join(WORKING_DIR, "api_documents_state.json")
+        state_data = {
+            "documents": documents,
+            "tasks": tasks,
+            "batch_operations": batch_operations,
+            "saved_at": datetime.now().isoformat()
+        }
+        with open(state_file, 'w', encoding='utf-8') as f:
+            json.dump(state_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"保存了 {len(documents)} 个文档状态到磁盘")
+    except Exception as e:
+        logger.error(f"保存文档状态失败: {str(e)}")
+
 async def load_existing_documents():
-    """从RAG存储中加载已存在的文档"""
-    global documents
+    """从RAG存储和API状态文件中加载已存在的文档"""
+    global documents, tasks, batch_operations
     
+    # 1. 首先尝试加载API服务器自己的状态文件
+    api_state_file = os.path.join(WORKING_DIR, "api_documents_state.json")
+    if os.path.exists(api_state_file):
+        try:
+            with open(api_state_file, 'r', encoding='utf-8') as f:
+                state_data = json.load(f)
+            
+            documents = state_data.get("documents", {})
+            tasks = state_data.get("tasks", {})
+            batch_operations = state_data.get("batch_operations", {})
+            
+            logger.info(f"从API状态文件加载了 {len(documents)} 个文档, {len(tasks)} 个任务")
+        except Exception as e:
+            logger.error(f"加载API状态文件失败: {str(e)}")
+    
+    # 2. 然后加载RAG系统中已处理的文档
     doc_status_file = os.path.join(WORKING_DIR, "kv_store_doc_status.json")
     if not os.path.exists(doc_status_file):
-        logger.info("没有找到现有文档状态文件")
+        logger.info("没有找到现有RAG文档状态文件")
         return
     
     try:
@@ -157,38 +197,44 @@ async def load_existing_documents():
         
         logger.info(f"从RAG存储中发现 {len(doc_status_data)} 个已处理文档")
         
+        # 只添加不存在的文档
+        added_count = 0
         for doc_id, doc_info in doc_status_data.items():
             if doc_info.get('status') == 'processed':
-                # 生成文档记录
-                document_id = str(uuid.uuid4())
-                file_name = os.path.basename(doc_info.get('file_path', f'document_{doc_id}'))
-                
-                document = {
-                    "document_id": document_id,
-                    "file_name": file_name,
-                    "file_path": doc_info.get('file_path', ''),
-                    "file_size": doc_info.get('content_length', 0),
-                    "status": "completed",
-                    "created_at": doc_info.get('created_at', datetime.now().isoformat()),
-                    "updated_at": doc_info.get('updated_at', datetime.now().isoformat()),
-                    "processing_time": 0,  # 历史文档没有处理时间记录
-                    "content_length": doc_info.get('content_length', 0),
-                    "chunks_count": doc_info.get('chunks_count', 0),
-                    "rag_doc_id": doc_id,  # 保存RAG系统的文档ID
-                    "content_summary": doc_info.get('content_summary', '')[:100] + "..." if doc_info.get('content_summary') else ""
-                }
-                
-                documents[document_id] = document
-                logger.info(f"加载已存在文档: {file_name} (chunks: {doc_info.get('chunks_count', 0)})")
+                # 检查是否已存在
+                existing = any(d.get('rag_doc_id') == doc_id for d in documents.values())
+                if not existing:
+                    # 生成文档记录
+                    document_id = str(uuid.uuid4())
+                    file_name = os.path.basename(doc_info.get('file_path', f'document_{doc_id}'))
+                    
+                    document = {
+                        "document_id": document_id,
+                        "file_name": file_name,
+                        "file_path": doc_info.get('file_path', ''),
+                        "file_size": doc_info.get('content_length', 0),
+                        "status": "completed",
+                        "created_at": doc_info.get('created_at', datetime.now().isoformat()),
+                        "updated_at": doc_info.get('updated_at', datetime.now().isoformat()),
+                        "processing_time": 0,  # 历史文档没有处理时间记录
+                        "content_length": doc_info.get('content_length', 0),
+                        "chunks_count": doc_info.get('chunks_count', 0),
+                        "rag_doc_id": doc_id,  # 保存RAG系统的文档ID
+                        "content_summary": doc_info.get('content_summary', '')[:100] + "..." if doc_info.get('content_summary') else ""
+                    }
+                    
+                    documents[document_id] = document
+                    added_count += 1
+                    logger.info(f"加载已存在文档: {file_name} (chunks: {doc_info.get('chunks_count', 0)})")
         
-        logger.info(f"成功加载 {len(documents)} 个已存在文档")
+        logger.info(f"新增 {added_count} 个RAG文档，总共 {len(documents)} 个文档")
         
     except Exception as e:
-        logger.error(f"加载已存在文档失败: {str(e)}")
+        logger.error(f"加载RAG文档失败: {str(e)}")
 
 async def initialize_rag():
-    """初始化RAG系统"""
-    global rag_instance
+    """初始化RAG系统和缓存增强处理器"""
+    global rag_instance, cache_enhanced_processor
     
     if rag_instance is not None:
         return rag_instance
@@ -202,7 +248,7 @@ async def initialize_rag():
         
         base_url = os.getenv("LLM_BINDING_HOST", "https://api.deepseek.com/v1")
         
-        # 创建配置 - 确保工作目录一致
+        # 创建配置 - 启用缓存和确保工作目录一致
         config = RAGAnythingConfig(
             working_dir=WORKING_DIR,
             parser_output_dir=OUTPUT_DIR,
@@ -278,16 +324,31 @@ async def initialize_rag():
             func=qwen_embed,
         )
         
+        # 配置LightRAG缓存设置
+        lightrag_kwargs = {
+            "enable_llm_cache": os.getenv("ENABLE_LLM_CACHE", "true").lower() == "true",
+        }
+        
         # 初始化RAGAnything
         rag_instance = RAGAnything(
             config=config,
             llm_model_func=llm_model_func,
             vision_model_func=vision_model_func,
             embedding_func=embedding_func,
+            lightrag_kwargs=lightrag_kwargs,
         )
         
         # 确保LightRAG实例已初始化
         await rag_instance._ensure_lightrag_initialized()
+        
+        # 初始化缓存统计跟踪
+        initialize_cache_tracking(WORKING_DIR)
+        
+        # 创建缓存增强处理器
+        cache_enhanced_processor = CacheEnhancedProcessor(
+            rag_instance=rag_instance,
+            storage_dir=WORKING_DIR
+        )
         
         logger.info("RAG系统初始化成功")
         logger.info(f"数据目录: {WORKING_DIR}")
@@ -295,6 +356,7 @@ async def initialize_rag():
         logger.info(f"RAGAnything工作目录: {rag_instance.working_dir}")
         logger.info(f"LLM: DeepSeek API")
         logger.info(f"嵌入: 本地Qwen3-Embedding-0.6B")
+        logger.info(f"缓存配置: Parse Cache={os.getenv('ENABLE_PARSE_CACHE', 'true')}, LLM Cache={os.getenv('ENABLE_LLM_CACHE', 'true')}")
         
         # 验证目录一致性
         if rag_instance.working_dir != WORKING_DIR:
@@ -311,12 +373,19 @@ async def initialize_rag():
 @app.on_event("startup")
 async def startup_event():
     """服务启动时初始化RAG系统"""
+    logger.info("=== 服务器启动初始化开始 ===")
+    
     # 设置WebSocket日志处理器
     setup_websocket_logging()
     websocket_log_handler.set_event_loop(asyncio.get_event_loop())
     
+    logger.info("初始化RAG系统...")
     await initialize_rag()
+    
+    logger.info("加载已存在的文档...")
     await load_existing_documents()
+    
+    logger.info(f"=== 服务器启动完成，当前有 {len(documents)} 个文档 ===")
 
 @app.get("/health")
 async def health_check():
@@ -888,8 +957,8 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
             device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
             await send_processing_log(f"🖥️  计算设备: {device_type.upper()}", "info")
             
-            # 更新处理开始时间
-            processing_start_time = datetime.now()
+            # Use original processing start time for total processing duration
+            # processing_start_time = datetime.now()  # Removed to fix variable scope error
             await rag.process_document_complete(
                 file_path=actual_file_path, 
                 output_dir=OUTPUT_DIR,
@@ -1243,6 +1312,9 @@ async def upload_document(file: UploadFile = File(...)):
     
     documents[document_id] = document
     
+    # 保存文档状态到磁盘
+    save_documents_state()
+    
     return {
         "success": True,
         "message": "Document uploaded successfully, ready for manual processing", 
@@ -1415,6 +1487,9 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
     logger.info(message)
     await send_processing_log(f"✅ {message}", "info")
     
+    # 保存文档状态到磁盘
+    save_documents_state()
+    
     return BatchUploadResponse(
         success=failed_count == 0,
         uploaded_count=uploaded_count,
@@ -1474,7 +1549,7 @@ async def process_document_manually(document_id: str):
 
 @app.post("/api/v1/documents/process/batch", response_model=BatchProcessResponse)
 async def process_documents_batch(request: BatchProcessRequest):
-    """批量文档处理端点"""
+    """优化的批量文档处理端点 - 使用RAGAnything的高级批量处理"""
     batch_operation_id = str(uuid.uuid4())
     started_count = 0
     failed_count = 0
@@ -1494,157 +1569,301 @@ async def process_documents_batch(request: BatchProcessRequest):
     }
     batch_operations[batch_operation_id] = batch_operation
     
-    logger.info(f"开始批量处理 {len(request.document_ids)} 个文档")
-    await send_processing_log(f"⚡ 开始批量处理 {len(request.document_ids)} 个文档", "info")
+    logger.info(f"🚀 开始高级批量处理 {len(request.document_ids)} 个文档")
+    await send_processing_log(f"🚀 开始高级批量处理 {len(request.document_ids)} 个文档", "info")
     
-    # 并发控制配置
-    max_concurrent = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def process_single_document(document_id: str, index: int) -> dict:
-        """处理单个文档的异步函数"""
-        doc_result = {
-            "document_id": document_id,
-            "file_name": "unknown",
-            "status": "failed",
-            "message": "",
-            "task_id": None
+    try:
+        # 初始化RAG系统
+        rag = await initialize_rag()
+        if not rag:
+            raise Exception("RAG系统初始化失败")
+        
+        # 步骤1: 转换文档ID为文件路径，验证文档状态
+        valid_documents = []
+        file_paths = []
+        
+        for document_id in request.document_ids:
+            try:
+                if document_id not in documents:
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": "unknown",
+                        "status": "failed",
+                        "message": "文档不存在",
+                        "task_id": None
+                    })
+                    failed_count += 1
+                    continue
+                
+                document = documents[document_id]
+                
+                # 检查文档状态
+                if document["status"] != "uploaded":
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "failed",
+                        "message": f"文档状态不允许处理: {document['status']}",
+                        "task_id": document.get("task_id")
+                    })
+                    failed_count += 1
+                    continue
+                
+                # 检查任务是否存在
+                task_id = document.get("task_id")
+                if not task_id or task_id not in tasks:
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "failed",
+                        "message": "处理任务不存在",
+                        "task_id": task_id
+                    })
+                    failed_count += 1
+                    continue
+                
+                # 验证文件路径存在
+                file_path = document["file_path"]
+                if not os.path.exists(file_path):
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "failed",
+                        "message": f"文件不存在: {file_path}",
+                        "task_id": task_id
+                    })
+                    failed_count += 1
+                    continue
+                
+                # 文档有效，添加到批处理列表
+                valid_documents.append({
+                    "document_id": document_id,
+                    "document": document,
+                    "task_id": task_id
+                })
+                file_paths.append(file_path)
+                
+                # 设置初始状态
+                document["status"] = "processing"
+                document["updated_at"] = datetime.now().isoformat()
+                tasks[task_id]["status"] = "pending"
+                tasks[task_id]["batch_operation_id"] = batch_operation_id
+                
+            except Exception as e:
+                results.append({
+                    "document_id": document_id,
+                    "file_name": documents.get(document_id, {}).get("file_name", "unknown"),
+                    "status": "failed",
+                    "message": f"准备处理时出错: {str(e)}",
+                    "task_id": None
+                })
+                failed_count += 1
+                logger.error(f"准备文档 {document_id} 失败: {str(e)}")
+        
+        # 如果有有效文档，使用缓存增强的高级批量处理
+        if file_paths:
+            await send_processing_log(f"📊 使用缓存增强的高级批量处理 {len(file_paths)} 个文档", "info")
+            
+            # 获取配置参数
+            max_workers = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
+            parse_method = request.parse_method or "auto"
+            device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+            
+            # 创建WebSocket进度回调
+            async def websocket_progress_callback(progress_data):
+                """WebSocket progress callback for real-time updates"""
+                try:
+                    # Send progress to all connected WebSocket clients
+                    for ws in processing_log_websockets:
+                        try:
+                            await ws.send_text(json.dumps(progress_data))
+                        except Exception:
+                            pass  # Remove disconnected clients silently
+                except Exception as e:
+                    logger.debug(f"WebSocket progress callback error: {e}")
+            
+            # Register progress callback with advanced progress tracker
+            advanced_progress_tracker.register_websocket_callback(websocket_progress_callback)
+            
+            try:
+                # 使用缓存增强处理器进行批量处理，带有增强的错误处理和进度跟踪
+                batch_result = await cache_enhanced_processor.batch_process_with_cache_tracking(
+                    file_paths=file_paths,
+                    progress_callback=websocket_progress_callback,
+                    output_dir=OUTPUT_DIR,
+                    parse_method=parse_method,
+                    max_workers=max_workers,
+                    recursive=False,  # 不扫描目录，处理明确的文件列表
+                    show_progress=True,
+                    lang="en",  # 可以从配置中获取
+                    device=device_type if TORCH_AVAILABLE else "cpu"
+                )
+            finally:
+                # Clean up progress callback registration
+                try:
+                    advanced_progress_tracker.unregister_websocket_callback(websocket_progress_callback)
+                except Exception:
+                    pass
+            
+            await send_processing_log(f"✅ RAGAnything批量处理完成", "info")
+            
+            # 步骤3: 处理批量结果并更新文档状态
+            parse_results = batch_result.get("parse_result", {})
+            rag_results = batch_result.get("rag_results", {})
+            successful_rag_files = batch_result.get("successful_rag_files", 0)
+            processing_time = batch_result.get("total_processing_time", 0)
+            cache_metrics = batch_result.get("cache_metrics", {})
+            
+            # 映射文件路径到文档ID
+            path_to_doc = {doc_info["document"]["file_path"]: doc_info for doc_info in valid_documents}
+            
+            # 处理成功的文件
+            for file_path in file_paths:
+                doc_info = path_to_doc[file_path]
+                document_id = doc_info["document_id"]
+                document = doc_info["document"]
+                task_id = doc_info["task_id"]
+                
+                # 检查RAG处理结果
+                rag_result = rag_results.get(file_path, {})
+                
+                if rag_result.get("processed", False):
+                    # 成功处理
+                    document["status"] = "completed"
+                    tasks[task_id]["status"] = "completed"
+                    tasks[task_id]["completed_at"] = datetime.now().isoformat()
+                    
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "success",
+                        "message": "文档批量处理成功",
+                        "task_id": task_id
+                    })
+                    started_count += 1
+                else:
+                    # 处理失败
+                    error_msg = rag_result.get("error", "批量处理过程中出现未知错误")
+                    document["status"] = "failed"
+                    tasks[task_id]["status"] = "failed"
+                    tasks[task_id]["error"] = error_msg
+                    tasks[task_id]["updated_at"] = datetime.now().isoformat()
+                    
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "failed",
+                        "message": f"RAG处理失败: {error_msg}",
+                        "task_id": task_id
+                    })
+                    failed_count += 1
+            
+            # 记录详细的缓存性能统计
+            cache_hits = cache_metrics.get("cache_hits", 0)
+            cache_misses = cache_metrics.get("cache_misses", 0)
+            time_saved = cache_metrics.get("total_time_saved", 0.0)
+            hit_ratio = cache_metrics.get("cache_hit_ratio", 0.0)
+            efficiency = cache_metrics.get("efficiency_improvement", 0.0)
+            
+            await send_processing_log(f"📈 批量处理性能统计: {successful_rag_files} 成功, 耗时 {processing_time:.2f}s", "info")
+            await send_processing_log(f"🚀 缓存性能: {cache_hits} 命中, {cache_misses} 未命中, 命中率 {hit_ratio:.1f}%", "info")
+            if time_saved > 0:
+                await send_processing_log(f"⚡ 时间节省: {time_saved:.1f}s, 效率提升 {efficiency:.1f}%", "info")
+        
+        # 更新批量操作状态
+        batch_operation["completed_items"] = started_count
+        batch_operation["failed_items"] = failed_count
+        batch_operation["progress"] = 100.0
+        batch_operation["status"] = "completed"
+        batch_operation["completed_at"] = datetime.now().isoformat()
+        batch_operation["results"] = results
+        
+        message = f"高级批量处理完成: {started_count} 个成功, {failed_count} 个失败"
+        logger.info(message)
+        await send_processing_log(f"🎉 {message}", "info")
+        
+        # 创建包含缓存性能的响应
+        response_data = {
+            "success": failed_count == 0,
+            "started_count": started_count,
+            "failed_count": failed_count,
+            "total_requested": len(request.document_ids),
+            "results": results,
+            "batch_operation_id": batch_operation_id,
+            "message": message,
+            "cache_performance": cache_metrics if cache_metrics else {
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "cache_hit_ratio": 0.0,
+                "total_time_saved": 0.0,
+                "efficiency_improvement": 0.0
+            }
         }
         
-        try:
-            # 检查文档是否存在
-            if document_id not in documents:
-                doc_result["message"] = "文档不存在"
-                return doc_result
-            
-            document = documents[document_id]
-            doc_result["file_name"] = document["file_name"]
-            
-            # 检查文档状态
-            if document["status"] != "uploaded":
-                doc_result["message"] = f"文档状态不允许处理: {document['status']}"
-                return doc_result
-            
-            # 检查任务是否存在
-            task_id = document.get("task_id")
-            if not task_id or task_id not in tasks:
-                doc_result["message"] = "处理任务不存在"
-                return doc_result
-            
-            # 先设置为queued状态，然后通过semaphore控制实际处理
-            document["status"] = "queued"
-            document["updated_at"] = datetime.now().isoformat()
-            
-            task = tasks[task_id]
-            task["status"] = "queued"
-            task["updated_at"] = datetime.now().isoformat()
-            task["batch_operation_id"] = batch_operation_id
-            
-            doc_result.update({
-                "status": "success",
-                "message": "文档已排队等待处理",
-                "task_id": task_id
-            })
-            
-            # 使用semaphore控制并发执行
-            async def controlled_processing():
-                try:
-                    async with semaphore:
-                        # 重新检查任务是否仍然存在（并发安全）
-                        if task_id not in tasks:
-                            logger.warning(f"任务已被删除，跳过处理: {task_id}")
-                            return
-                        
-                        # 更新为processing状态
-                        document["status"] = "processing"
-                        current_task = tasks[task_id]  # 获取当前任务引用
-                        current_task["status"] = "pending"
-                        await send_processing_log(f"🔥 开始处理文档: {document['file_name']}", "info")
-                        
-                        # 启动实际处理任务
-                        file_path = document["file_path"]
-                        await process_document_real(task_id, file_path)
-                        
-                        # 处理成功后的状态更新
-                        await send_processing_log(f"✅ 文档处理完成: {document['file_name']}", "info")
-                        
-                except Exception as e:
-                    # 确保错误时正确更新状态，再次检查任务存在性
-                    document["status"] = "failed"
-                    if task_id in tasks:
-                        current_task = tasks[task_id]
-                        current_task["status"] = "failed"
-                        current_task["error"] = str(e)
-                        current_task["updated_at"] = datetime.now().isoformat()
-                    await send_processing_log(f"❌ 文档处理失败: {document['file_name']} - {str(e)}", "error")
-                    logger.error(f"处理文档 {document['file_name']} 失败: {str(e)}")
-                    # semaphore在async with块结束时会自动释放
-            
-            # 启动受控制的处理任务
-            asyncio.create_task(controlled_processing())
-            
-            return doc_result
-            
-        except Exception as e:
-            doc_result["message"] = f"启动处理失败: {str(e)}"
-            logger.error(f"批量处理文档 {document_id} 失败: {str(e)}")
-            return doc_result
-    
-    # 执行批量处理
-    processing_tasks = []
-    for i, document_id in enumerate(request.document_ids):
-        task = process_single_document(document_id, i)
-        processing_tasks.append(task)
-    
-    # 等待所有处理任务完成
-    processing_results = await asyncio.gather(*processing_tasks, return_exceptions=True)
-    
-    # 统计结果
-    for i, result in enumerate(processing_results):
-        if isinstance(result, Exception):
-            # 处理异常情况
-            doc_result = {
-                "document_id": request.document_ids[i],
-                "file_name": "unknown",
-                "status": "failed",
-                "message": f"处理异常: {str(result)}",
-                "task_id": None
-            }
-            failed_count += 1
-            batch_operation["failed_items"] += 1
-        else:
-            if result["status"] == "success":
-                started_count += 1
-                batch_operation["completed_items"] += 1
-            else:
-                failed_count += 1
-                batch_operation["failed_items"] += 1
-            doc_result = result
+        return BatchProcessResponse(**response_data)
         
-        results.append(doc_result)
+    except Exception as e:
+        # 使用增强的错误处理器
+        error_info = enhanced_error_handler.categorize_error(e, {
+            "operation": "batch_processing",
+            "batch_id": batch_operation_id,
+            "document_count": len(request.document_ids),
+            "context": "api_endpoint"
+        })
         
-        # 更新进度
-        batch_operation["progress"] = ((i + 1) / len(request.document_ids)) * 100
-        await send_processing_log(f"⚡ 批量处理进度: {i + 1}/{len(request.document_ids)} ({batch_operation['progress']:.1f}%)", "info")
-    
-    # 完成批量操作
-    batch_operation["status"] = "completed"
-    batch_operation["completed_at"] = datetime.now().isoformat()
-    batch_operation["results"] = results
-    
-    message = f"批量处理完成: {started_count} 个启动成功, {failed_count} 个失败"
-    logger.info(message)
-    await send_processing_log(f"✅ {message}", "info")
-    
-    return BatchProcessResponse(
-        success=failed_count == 0,
-        started_count=started_count,
-        failed_count=failed_count,
-        total_requested=len(request.document_ids),
-        results=results,
-        batch_operation_id=batch_operation_id,
-        message=message
-    )
+        # 获取用户友好的错误信息
+        user_error = enhanced_error_handler.get_user_friendly_error_message(error_info)
+        
+        error_msg = f"批量处理失败: {user_error['message']}"
+        logger.error(f"Batch processing error: {error_info.message}")
+        await send_processing_log(f"❌ {error_msg}", "error")
+        
+        # 如果是可恢复的错误，提供建议
+        if error_info.is_recoverable:
+            await send_processing_log(f"💡 建议: {user_error['suggested_solution']}", "warning")
+        
+        # 获取系统健康警告
+        health_warnings = enhanced_error_handler.get_system_health_warnings()
+        for warning in health_warnings:
+            await send_processing_log(f"⚠️ 系统警告: {warning}", "warning")
+        
+        # 更新所有待处理文档的状态为失败
+        for document_id in request.document_ids:
+            if document_id in documents:
+                document = documents[document_id]
+                document["status"] = "failed"
+                document["error_category"] = error_info.category.value
+                document["error_severity"] = user_error['severity']
+                document["suggested_solution"] = user_error['suggested_solution']
+                
+                task_id = document.get("task_id")
+                if task_id and task_id in tasks:
+                    tasks[task_id]["status"] = "failed"
+                    tasks[task_id]["error"] = error_msg
+                    tasks[task_id]["error_category"] = error_info.category.value
+                    tasks[task_id]["error_details"] = user_error
+                    tasks[task_id]["updated_at"] = datetime.now().isoformat()
+        
+        # 更新批量操作状态
+        batch_operation["status"] = "failed"
+        batch_operation["failed_items"] = len(request.document_ids)
+        batch_operation["completed_at"] = datetime.now().isoformat()
+        batch_operation["error"] = error_msg
+        batch_operation["error_details"] = user_error
+        batch_operation["system_warnings"] = health_warnings
+        
+        # 返回详细的错误信息
+        error_response = {
+            "error": error_msg,
+            "error_category": error_info.category.value,
+            "error_severity": user_error['severity'],
+            "is_recoverable": error_info.is_recoverable,
+            "suggested_solution": user_error['suggested_solution'],
+            "system_warnings": health_warnings,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        raise HTTPException(status_code=500, detail=error_response)
 
 @app.post("/api/v1/query")
 async def query_documents(request: QueryRequest):
@@ -2265,14 +2484,283 @@ async def list_batch_operations(limit: int = 50, status: Optional[str] = None):
         "total": len(operations)
     }
 
+@app.get("/api/v1/cache/statistics")
+async def get_cache_statistics():
+    """获取缓存统计信息"""
+    global cache_enhanced_processor
+    
+    if not cache_enhanced_processor:
+        return {
+            "success": False,
+            "error": "Cache enhanced processor not initialized"
+        }
+    
+    try:
+        stats = cache_enhanced_processor.get_cache_statistics()
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "statistics": stats
+        }
+    except Exception as e:
+        logger.error(f"获取缓存统计失败: {e}")
+        return {
+            "success": False,
+            "error": f"获取缓存统计失败: {str(e)}"
+        }
+
+@app.get("/api/v1/cache/activity")
+async def get_cache_activity(limit: int = 50):
+    """获取缓存活动记录"""
+    global cache_enhanced_processor
+    
+    if not cache_enhanced_processor:
+        return {
+            "success": False,
+            "error": "Cache enhanced processor not initialized"
+        }
+    
+    try:
+        activity = cache_enhanced_processor.get_cache_activity(limit)
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "activity": activity
+        }
+    except Exception as e:
+        logger.error(f"获取缓存活动失败: {e}")
+        return {
+            "success": False,
+            "error": f"获取缓存活动失败: {str(e)}"
+        }
+
+@app.get("/api/v1/cache/status")
+async def get_cache_status():
+    """获取缓存状态信息"""
+    global cache_enhanced_processor
+    
+    if not cache_enhanced_processor:
+        return {
+            "success": False,
+            "error": "Cache enhanced processor not initialized"
+        }
+    
+    try:
+        cache_status = cache_enhanced_processor.is_cache_enabled()
+        cache_stats = cache_enhanced_processor.get_cache_statistics()
+        
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "cache_status": cache_status,
+            "quick_stats": {
+                "total_operations": cache_stats.get("overall_statistics", {}).get("total_operations", 0),
+                "hit_ratio": cache_stats.get("overall_statistics", {}).get("hit_ratio_percent", 0),
+                "time_saved": cache_stats.get("overall_statistics", {}).get("total_time_saved_seconds", 0),
+                "efficiency": cache_stats.get("overall_statistics", {}).get("efficiency_improvement_percent", 0),
+                "health": cache_stats.get("cache_health", {}).get("status", "unknown")
+            }
+        }
+    except Exception as e:
+        logger.error(f"获取缓存状态失败: {e}")
+        return {
+            "success": False,
+            "error": f"获取缓存状态失败: {str(e)}"
+        }
+
+@app.get("/api/v1/batch-progress/{batch_id}")
+async def get_batch_progress(batch_id: str):
+    """获取批量操作的实时进度"""
+    progress = advanced_progress_tracker.get_batch_progress(batch_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="批量操作不存在或已完成")
+    
+    return {
+        "success": True,
+        "batch_progress": progress,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/v1/batch-progress")
+async def get_all_batch_progress():
+    """获取所有活跃批量操作的进度"""
+    active_batches = advanced_progress_tracker.get_all_active_batches()
+    progress_history = advanced_progress_tracker.get_progress_history(limit=20)
+    
+    return {
+        "success": True,
+        "active_batches": active_batches,
+        "recent_history": progress_history,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/v1/batch-progress/{batch_id}/cancel")
+async def cancel_batch_progress(batch_id: str):
+    """取消批量操作"""
+    try:
+        await advanced_progress_tracker.cancel_batch(batch_id)
+        return {
+            "success": True,
+            "message": f"批量操作 {batch_id} 已取消",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"取消批量操作失败: {e}")
+        raise HTTPException(status_code=500, detail=f"取消操作失败: {str(e)}")
+
+@app.get("/api/v1/system/health")
+async def get_enhanced_system_health():
+    """获取增强的系统健康状态"""
+    try:
+        # 获取基本系统指标
+        metrics = get_system_metrics()
+        
+        # 获取错误处理器的健康警告
+        health_warnings = enhanced_error_handler.get_system_health_warnings()
+        
+        # 检查GPU状态
+        gpu_status = "unavailable"
+        gpu_memory_info = {}
+        if TORCH_AVAILABLE:
+            try:
+                if torch.cuda.is_available():
+                    gpu_status = "available"
+                    gpu_memory_info = {
+                        "total": torch.cuda.get_device_properties(0).total_memory,
+                        "allocated": torch.cuda.memory_allocated(),
+                        "cached": torch.cuda.memory_reserved()
+                    }
+            except Exception as e:
+                gpu_status = f"error: {str(e)}"
+        
+        # 检查存储空间
+        storage_warnings = []
+        try:
+            working_disk = psutil.disk_usage(WORKING_DIR)
+            output_disk = psutil.disk_usage(OUTPUT_DIR)
+            upload_disk = psutil.disk_usage(UPLOAD_DIR)
+            
+            for name, disk_info, path in [
+                ("工作目录", working_disk, WORKING_DIR),
+                ("输出目录", output_disk, OUTPUT_DIR),
+                ("上传目录", upload_disk, UPLOAD_DIR)
+            ]:
+                free_gb = disk_info.free / (1024**3)
+                if free_gb < 5.0:  # Less than 5GB free
+                    storage_warnings.append(f"{name} ({path}) 存储空间不足: {free_gb:.1f}GB")
+        except Exception as e:
+            storage_warnings.append(f"无法检查存储空间: {str(e)}")
+        
+        # 综合健康评分
+        health_score = 100.0
+        issues = []
+        
+        if metrics["memory_usage"] > 85:
+            health_score -= 20
+            issues.append("内存使用率过高")
+        elif metrics["memory_usage"] > 70:
+            health_score -= 10
+            issues.append("内存使用率较高")
+        
+        if metrics["cpu_usage"] > 90:
+            health_score -= 15
+            issues.append("CPU使用率过高")
+        elif metrics["cpu_usage"] > 75:
+            health_score -= 8
+            issues.append("CPU使用率较高")
+        
+        if metrics["disk_usage"] > 90:
+            health_score -= 25
+            issues.append("磁盘使用率过高")
+        elif metrics["disk_usage"] > 80:
+            health_score -= 12
+            issues.append("磁盘使用率较高")
+        
+        if health_warnings:
+            health_score -= len(health_warnings) * 5
+            issues.extend(health_warnings)
+        
+        if storage_warnings:
+            health_score -= len(storage_warnings) * 10
+            issues.extend(storage_warnings)
+        
+        health_score = max(0, health_score)
+        
+        # 确定整体状态
+        if health_score >= 85:
+            overall_status = "excellent"
+        elif health_score >= 70:
+            overall_status = "good"
+        elif health_score >= 50:
+            overall_status = "warning"
+        else:
+            overall_status = "critical"
+        
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "overall_status": overall_status,
+            "health_score": round(health_score, 1),
+            "system_metrics": metrics,
+            "gpu_status": gpu_status,
+            "gpu_memory": gpu_memory_info,
+            "storage_warnings": storage_warnings,
+            "health_warnings": health_warnings,
+            "issues": issues,
+            "recommendations": [
+                "定期清理临时文件和缓存" if metrics["disk_usage"] > 70 else None,
+                "考虑增加系统内存" if metrics["memory_usage"] > 80 else None,
+                "检查系统负载和后台进程" if metrics["cpu_usage"] > 80 else None,
+                "监控GPU温度和使用情况" if gpu_status == "available" else None
+            ],
+            "processing_stats": {
+                "active_batches": len(advanced_progress_tracker.get_all_active_batches()),
+                "cache_enabled": cache_enhanced_processor.is_cache_enabled() if cache_enhanced_processor else {},
+                "error_handler_status": "active"
+            }
+        }
+    except Exception as e:
+        logger.error(f"获取系统健康状态失败: {e}")
+        return {
+            "success": False,
+            "error": f"获取系统健康状态失败: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.post("/api/v1/cache/clear")
+async def clear_cache_statistics():
+    """清除缓存统计数据"""
+    global cache_enhanced_processor
+    
+    if not cache_enhanced_processor:
+        return {
+            "success": False,
+            "error": "Cache enhanced processor not initialized"
+        }
+    
+    try:
+        cache_enhanced_processor.clear_cache_statistics()
+        logger.info("缓存统计数据已清除")
+        return {
+            "success": True,
+            "message": "缓存统计数据已清除",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"清除缓存统计失败: {e}")
+        return {
+            "success": False,
+            "error": f"清除缓存统计失败: {str(e)}"
+        }
+
 if __name__ == "__main__":
-    print("🚀 Starting RAG-Anything API Server with Smart Parser Routing & Batch Processing Support")
+    print("🚀 Starting RAG-Anything API Server with Enhanced Error Handling & Advanced Progress Tracking")
     print("📋 Available endpoints:")
     print("   🔍 Health: http://127.0.0.1:8001/health")
     print("   📤 Upload: http://127.0.0.1:8001/api/v1/documents/upload") 
     print("   📤 Batch Upload: http://127.0.0.1:8001/api/v1/documents/upload/batch")
     print("   ▶️  Manual Process: http://127.0.0.1:8001/api/v1/documents/{document_id}/process")
-    print("   ⚡ Batch Process: http://127.0.0.1:8001/api/v1/documents/process/batch")
+    print("   ⚡ Enhanced Batch Process: http://127.0.0.1:8001/api/v1/documents/process/batch")
     print("   📋 Tasks: http://127.0.0.1:8001/api/v1/tasks")
     print("   📊 Detailed Status: http://127.0.0.1:8001/api/v1/tasks/{task_id}/detailed-status")
     print("   📄 Docs: http://127.0.0.1:8001/api/v1/documents")
@@ -2282,14 +2770,38 @@ if __name__ == "__main__":
     print("   📋 Batch Operations: http://127.0.0.1:8001/api/v1/batch-operations")
     print("   🔌 WebSocket: ws://127.0.0.1:8001/ws/task/{task_id}")
     print()
-    print("🧠 Smart Features:")
+    print("📊 Enhanced Progress & Error Tracking:")
+    print("   📈 Batch Progress: http://127.0.0.1:8001/api/v1/batch-progress")
+    print("   📊 Batch Progress (ID): http://127.0.0.1:8001/api/v1/batch-progress/{batch_id}")
+    print("   ❌ Cancel Batch: http://127.0.0.1:8001/api/v1/batch-progress/{batch_id}/cancel")
+    print("   🏥 Enhanced Health: http://127.0.0.1:8001/api/v1/system/health")
+    print()
+    print("💾 Cache Management:")
+    print("   📈 Cache Statistics: http://127.0.0.1:8001/api/v1/cache/statistics")
+    print("   📊 Cache Status: http://127.0.0.1:8001/api/v1/cache/status")
+    print("   📋 Cache Activity: http://127.0.0.1:8001/api/v1/cache/activity")
+    print("   🗑️  Clear Cache Stats: http://127.0.0.1:8001/api/v1/cache/clear")
+    print()
+    print("🔥 Enhanced Features:")
+    print("   🛡️  Intelligent error categorization and recovery")
+    print("   📊 Real-time progress tracking with ETA calculations")
+    print("   💾 Advanced cache performance monitoring")
+    print("   🔄 Automatic retry mechanisms with exponential backoff")
+    print("   🖥️  GPU memory management and device switching")
+    print("   ⚠️  System health warnings and recommendations")
+    print("   📈 Performance baseline learning and optimization")
+    print("   🎯 User-friendly error messages with solutions")
+    print("   📡 WebSocket-based real-time progress updates")
+    print("   🏥 Comprehensive system health monitoring")
+    print()
+    print("🧠 Smart Processing:")
     print("   ⚡ Direct text processing (TXT/MD files)")
     print("   📄 PDF files → MinerU (specialized PDF engine)")
     print("   📊 Office files → Docling (native Office support)")
     print("   🖼️  Image files → MinerU (OCR capability)")
     print("   📈 Real-time parser usage statistics")
-    print("   📊 Detailed processing status like native_with_qwen.py")
     print("   🎯 Manual processing control - upload without auto-processing")
+    print("   💾 Intelligent caching with file modification tracking")
     print()
     
-    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8001, log_level="info")

@@ -164,49 +164,99 @@ export class BatchProcessor {
 
 /**
  * 批量文档处理专用函数
+ * 使用后端专用的批量处理API，而不是并行调用个别文档端点
+ * 
+ * 重要变更：
+ * - 现在调用 POST /api/v1/documents/process/batch 而不是多个 POST /api/v1/documents/{id}/process
+ * - 这避免了 N 个并行请求，改为 1 个批量请求
+ * - 后端会在内部处理并发控制和资源管理
+ * - 返回批量操作ID用于可能的状态跟踪
  */
 export async function batchProcessDocuments(
   documentIds: string[],
-  onProgress?: (completed: number, total: number, results: any[]) => void
+  onProgress?: (completed: number, total: number, results: any[]) => void,
+  parser?: string,
+  parseMethod?: string
 ): Promise<{
   successCount: number
   failCount: number
   results: BatchProcessResult<any>[]
   errors: string[]
+  batchOperationId?: string
 }> {
   const errors: string[] = []
   
-  const results = await BatchProcessor.processInParallel(
-    documentIds,
-    async (documentId) => {
-      const response = await axios.post(`/api/v1/documents/${documentId}/process`)
-      if (!response.data?.success) {
-        throw new Error(response.data?.message || '处理失败')
-      }
-      return response.data
-    },
-    {
-      maxConcurrent: PERFORMANCE_CONFIG.batch.maxConcurrentProcess,
-      chunkSize: PERFORMANCE_CONFIG.batch.processChunkSize,
-      onProgress: (completed, total) => {
-        onProgress?.(completed, total, results)
-      },
-      onItemComplete: (result) => {
-        if (!result.success && result.error) {
-          errors.push(`文档 ${result.item}: ${result.error}`)
-        }
-      }
+  try {
+    // 调用后端专用的批量处理端点
+    const response = await axios.post('/api/v1/documents/process/batch', {
+      document_ids: documentIds,
+      parser: parser,
+      parse_method: parseMethod
+    })
+    
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '批量处理请求失败')
     }
-  )
-  
-  const successCount = results.filter(r => r.success).length
-  const failCount = results.filter(r => !r.success).length
-  
-  return {
-    successCount,
-    failCount,
-    results,
-    errors
+    
+    const batchResult = response.data
+    const results: BatchProcessResult<any>[] = []
+    
+    // 转换后端批量响应为前端期望的格式
+    batchResult.results.forEach((backendResult: any, index: number) => {
+      const success = backendResult.status === 'started' || backendResult.status === 'success'
+      const result: BatchProcessResult<any> = {
+        success,
+        data: success ? backendResult : undefined,
+        error: success ? undefined : (backendResult.message || '处理启动失败'),
+        index,
+        item: backendResult.document_id
+      }
+      
+      results.push(result)
+      
+      if (!success && backendResult.message) {
+        errors.push(`文档 ${backendResult.file_name || backendResult.document_id}: ${backendResult.message}`)
+      }
+    })
+    
+    // 立即报告完成状态给进度回调
+    const successCount = batchResult.started_count
+    const failCount = batchResult.failed_count
+    const totalCount = batchResult.total_requested
+    
+    // 调用进度回调表示批量启动完成
+    onProgress?.(totalCount, totalCount, results)
+    
+    return {
+      successCount,
+      failCount,
+      results,
+      errors,
+      batchOperationId: batchResult.batch_operation_id
+    }
+    
+  } catch (error) {
+    // 网络或请求错误处理
+    const errorMessage = axios.isAxiosError(error)
+      ? error.response?.data?.message || error.message
+      : '批量处理请求失败'
+    
+    // 为所有文档创建失败结果
+    const results: BatchProcessResult<any>[] = documentIds.map((documentId, index) => ({
+      success: false,
+      error: errorMessage,
+      index,
+      item: documentId
+    }))
+    
+    errors.push(`批量处理失败: ${errorMessage}`)
+    
+    return {
+      successCount: 0,
+      failCount: documentIds.length,
+      results,
+      errors
+    }
   }
 }
 
