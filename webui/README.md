@@ -54,8 +54,8 @@ npm run lint
 
 Vite已配置API代理，前端请求会自动转发到后端：
 - 前端: http://localhost:3000
-- 后端: http://localhost:8000
-- API代理: /api/* → http://localhost:8000/api/*
+- 后端: http://localhost:8001
+- API代理: /api/* → http://localhost:8001/api/*
 
 ## 从原版升级
 

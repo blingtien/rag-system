@@ -353,6 +353,28 @@ def deepseek_vision_complete(
             
         vision_messages.append({"role": "user", "content": content})
         
+        # Validate payload size before API call
+        try:
+            import json
+            payload_json = json.dumps(vision_messages, ensure_ascii=False)
+            payload_size_kb = len(payload_json.encode('utf-8')) / 1024
+            
+            logger.info(f"Vision API payload size: {payload_size_kb:.1f}KB")
+            
+            # Warn for large payloads
+            if payload_size_kb > 300:
+                logger.warning(f"Large API payload detected: {payload_size_kb:.1f}KB")
+                logger.warning("This may cause API failures. Consider image compression.")
+            
+            # Critical size check
+            if payload_size_kb > 1000:  # 1MB limit
+                logger.error(f"Critical payload size: {payload_size_kb:.1f}KB - likely to cause API failure")
+                logger.error("Payload exceeds reasonable limits for vision API")
+                # Consider returning an error instead of proceeding
+                
+        except Exception as payload_check_error:
+            logger.debug(f"Could not validate payload size: {payload_check_error}")
+        
         return deepseek_complete_if_cache(
             model=model,
             prompt="",

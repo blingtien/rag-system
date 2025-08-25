@@ -91,7 +91,15 @@ const DocumentManager: React.FC = () => {
   const [processingLogs, setProcessingLogs] = useState<string[]>([])
   const [selectedDocuments, setSelectedDocuments] = useState<string[]>([])
   const [dragOver, setDragOver] = useState(false)
+  const [currentPageDocuments, setCurrentPageDocuments] = useState<Document[]>([])
   const isDragEventRef = useRef(false)
+  
+  // 扫描uploads文件夹相关状态
+  const [scanning, setScanning] = useState(false)
+  const [unprocessedFiles, setUnprocessedFiles] = useState<any[]>([])
+  const [scanResults, setScanResults] = useState<any>(null)
+  const [showScanModal, setShowScanModal] = useState(false)
+  const [processingUnprocessed, setProcessingUnprocessed] = useState(false)
   
   // Refs for cleanup and state management
   const wsRef = useRef<WebSocket | null>(null)
@@ -397,6 +405,77 @@ const DocumentManager: React.FC = () => {
         }
       }
     })
+  }
+
+  // 扫描uploads文件夹
+  const scanUploadsFolder = async () => {
+    setScanning(true)
+    try {
+      const response = await axios.get('/api/v1/documents/scan-uploads-folder')
+      if (response.data?.success) {
+        setScanResults(response.data)
+        setUnprocessedFiles(response.data.unprocessed_file_list || [])
+        setShowScanModal(true)
+        message.success(response.data.message)
+      } else {
+        message.error(response.data?.message || '扫描失败')
+      }
+    } catch (error) {
+      const errorMessage = axios.isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : '扫描失败'
+      message.error(errorMessage)
+      console.error('扫描uploads文件夹失败:', error)
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  // 处理未处理的文件
+  const processUnprocessedFiles = async () => {
+    if (unprocessedFiles.length === 0) {
+      message.warning('没有未处理的文件')
+      return
+    }
+
+    setProcessingUnprocessed(true)
+    try {
+      const response = await axios.post('/api/v1/documents/process-unprocessed-files', {
+        parser: 'mineru',
+        parse_method: 'auto'
+      })
+      
+      if (response.data?.success) {
+        message.success(response.data.message)
+        setShowScanModal(false)
+        await refreshData() // 刷新文档列表以显示新添加的文件
+        
+        // 如果添加了文件，显示批量处理选项
+        if (response.data.added_count > 0) {
+          Modal.info({
+            title: '文件已添加',
+            content: `成功添加了 ${response.data.added_count} 个文件到系统中。您可以在文档列表中看到这些文件，并选择批量处理。`,
+            onOk: () => {
+              // 自动滚动到文档列表区域
+              const documentSection = document.querySelector('[data-testid="document-table"]')
+              if (documentSection) {
+                documentSection.scrollIntoView({ behavior: 'smooth' })
+              }
+            }
+          })
+        }
+      } else {
+        message.error(response.data?.message || '处理失败')
+      }
+    } catch (error) {
+      const errorMessage = axios.isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : '处理失败'
+      message.error(errorMessage)
+      console.error('处理未处理文件失败:', error)
+    } finally {
+      setProcessingUnprocessed(false)
+    }
   }
 
   // Format file size
@@ -847,19 +926,27 @@ const DocumentManager: React.FC = () => {
   // Batch selection related methods
   const handleSelectAll = useCallback((checked: boolean) => {
     if (checked) {
-      const selectableIds = documents
+      // 只选中当前页显示的可选择文档
+      const selectableIds = currentPageDocuments
         .filter(doc => doc.status_code !== 'processing')
         .slice(0, MAX_BATCH_SELECTION)
         .map(doc => doc.document_id)
-      setSelectedDocuments(selectableIds)
       
-      if (documents.length > MAX_BATCH_SELECTION) {
-        message.info(`只选择了前 ${MAX_BATCH_SELECTION} 个文档`)
+      // 合并当前选择和新选择的文档
+      setSelectedDocuments(prev => {
+        const newSelection = [...prev, ...selectableIds.filter(id => !prev.includes(id))]
+        return newSelection.slice(0, MAX_BATCH_SELECTION)
+      })
+      
+      if (selectableIds.length > 0) {
+        message.info(`已选择当前页的 ${selectableIds.length} 个文档`)
       }
     } else {
-      setSelectedDocuments([])
+      // 取消选择当前页的文档
+      const currentPageIds = currentPageDocuments.map(doc => doc.document_id)
+      setSelectedDocuments(prev => prev.filter(id => !currentPageIds.includes(id)))
     }
-  }, [documents])
+  }, [currentPageDocuments])
 
   const handleSelectDocument = useCallback((documentId: string, checked: boolean) => {
     setSelectedDocuments(prev => {
@@ -924,10 +1011,11 @@ const DocumentManager: React.FC = () => {
     // onDrop is handled by the container div to avoid duplication
   }
 
-  // Check selection states
-  const selectableDocuments = documents.filter(doc => doc.status_code !== 'processing')
-  const isAllSelected = selectableDocuments.length > 0 && selectedDocuments.length === Math.min(selectableDocuments.length, MAX_BATCH_SELECTION)
-  const isIndeterminate = selectedDocuments.length > 0 && selectedDocuments.length < Math.min(selectableDocuments.length, MAX_BATCH_SELECTION)
+  // Check selection states - 基于当前页显示的文档
+  const selectableCurrentPageDocs = currentPageDocuments.filter(doc => doc.status_code !== 'processing')
+  const currentPageSelectedCount = currentPageDocuments.filter(doc => selectedDocuments.includes(doc.document_id)).length
+  const isAllSelected = selectableCurrentPageDocs.length > 0 && currentPageSelectedCount === selectableCurrentPageDocs.length
+  const isIndeterminate = currentPageSelectedCount > 0 && currentPageSelectedCount < selectableCurrentPageDocs.length
 
   // Enhanced document table columns with batch selection
   const documentColumns = [
@@ -938,7 +1026,7 @@ const DocumentManager: React.FC = () => {
           onChange={(e) => handleSelectAll(e.target.checked)}
           checked={isAllSelected}
         >
-          全选
+          全选本页
         </Checkbox>
       ),
       dataIndex: 'selection',
@@ -1102,6 +1190,11 @@ const DocumentManager: React.FC = () => {
       count: documents.length,
       documents: documents.map(d => ({ id: d.document_id, name: d.file_name, status: d.status_code }))
     })
+    
+    // 当文档数据变化时，更新当前页文档（默认第一页，每页10条）
+    const defaultPageSize = 10
+    const firstPageDocs = documents.slice(0, defaultPageSize)
+    setCurrentPageDocuments(firstPageDocs)
   }, [documents])
 
   // Debug effect to track loading state changes  
@@ -1136,6 +1229,14 @@ const DocumentManager: React.FC = () => {
               onClick={refreshData}
             >
               刷新 (调试: {documents.length} 文档)
+            </Button>
+            <Button 
+              icon={<FolderOpenOutlined />}
+              loading={scanning}
+              onClick={scanUploadsFolder}
+              type="primary"
+            >
+              扫描uploads文件夹
             </Button>
             <Button 
               danger 
@@ -1453,12 +1554,35 @@ const DocumentManager: React.FC = () => {
             showSizeChanger: true,
             showQuickJumper: true,
             showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条，共 ${total} 条`,
+            onChange: (page, pageSize) => {
+              // 计算当前页显示的文档
+              const startIndex = (page - 1) * (pageSize || 10)
+              const endIndex = startIndex + (pageSize || 10)
+              const currentPageDocs = documents.slice(startIndex, endIndex)
+              setCurrentPageDocuments(currentPageDocs)
+            },
+            onShowSizeChange: (current, size) => {
+              // 页面大小改变时也需要更新当前页文档
+              const startIndex = (current - 1) * size
+              const endIndex = startIndex + size
+              const currentPageDocs = documents.slice(startIndex, endIndex)
+              setCurrentPageDocuments(currentPageDocs)
+            }
           }}
           locale={{
             emptyText: `暂无文档数据 (调试: documents数组长度=${documents.length}, refreshing=${refreshing})`
           }}
           scroll={{ x: true }}
           loading={refreshing}
+          onChange={(pagination) => {
+            // 当表格发生任何变化时更新当前页文档
+            if (pagination.current && pagination.pageSize) {
+              const startIndex = (pagination.current - 1) * pagination.pageSize
+              const endIndex = startIndex + pagination.pageSize
+              const currentPageDocs = documents.slice(startIndex, endIndex)
+              setCurrentPageDocuments(currentPageDocs)
+            }
+          }}
         />
       </Card>
 
@@ -1488,6 +1612,95 @@ const DocumentManager: React.FC = () => {
           ))}
         </Row>
       </Card>
+
+      {/* 扫描结果Modal */}
+      <Modal
+        title="扫描uploads文件夹结果"
+        visible={showScanModal}
+        onCancel={() => setShowScanModal(false)}
+        width={800}
+        footer={[
+          <Button key="cancel" onClick={() => setShowScanModal(false)}>
+            取消
+          </Button>,
+          <Button
+            key="process"
+            type="primary"
+            loading={processingUnprocessed}
+            disabled={unprocessedFiles.length === 0}
+            onClick={processUnprocessedFiles}
+            icon={<PlaySquareOutlined />}
+          >
+            添加并准备处理 ({unprocessedFiles.length}个文件)
+          </Button>,
+        ]}
+      >
+        {scanResults && (
+          <div>
+            <Alert
+              message={`扫描完成：共发现 ${scanResults.scanned_files} 个文件，其中 ${scanResults.unprocessed_files} 个未处理`}
+              type={scanResults.unprocessed_files > 0 ? "info" : "success"}
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+            
+            {unprocessedFiles.length > 0 ? (
+              <div>
+                <Title level={4}>未处理的文件列表：</Title>
+                <div style={{ maxHeight: 400, overflowY: 'auto' }}>
+                  <Table
+                    dataSource={unprocessedFiles}
+                    rowKey="file_name"
+                    size="small"
+                    pagination={false}
+                    columns={[
+                      {
+                        title: '文件名',
+                        dataIndex: 'file_name',
+                        key: 'file_name',
+                        ellipsis: true,
+                      },
+                      {
+                        title: '文件大小',
+                        dataIndex: 'file_size_display',
+                        key: 'file_size_display',
+                        width: 100,
+                      },
+                      {
+                        title: '文件类型',
+                        dataIndex: 'extension',
+                        key: 'extension',
+                        width: 80,
+                        render: (ext: string) => <Tag color="blue">{ext}</Tag>
+                      },
+                      {
+                        title: '修改时间',
+                        dataIndex: 'modified_time',
+                        key: 'modified_time',
+                        width: 150,
+                        render: (time: string) => {
+                          try {
+                            return new Date(time).toLocaleString()
+                          } catch {
+                            return time
+                          }
+                        }
+                      },
+                    ]}
+                  />
+                </div>
+              </div>
+            ) : (
+              <Alert
+                message="没有发现未处理的文件"
+                description="uploads文件夹中的所有文件都已经在系统中了。"
+                type="success"
+                showIcon
+              />
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

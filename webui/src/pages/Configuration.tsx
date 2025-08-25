@@ -75,7 +75,7 @@ const Configuration: React.FC = () => {
             <strong>前端版本:</strong> React + TypeScript + Ant Design
           </div>
           <div>
-            <strong>后端API:</strong> http://localhost:8000
+            <strong>后端API:</strong> http://localhost:8001
           </div>
           <div>
             <strong>构建工具:</strong> Vite

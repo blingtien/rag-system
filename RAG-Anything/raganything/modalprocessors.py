@@ -29,6 +29,15 @@ from lightrag.operate import extract_entities, merge_nodes_and_edges
 # Import prompt templates
 from raganything.prompt import PROMPTS
 
+# Import image processing utilities
+try:
+    from raganything.image_utils import validate_and_compress_image, validate_payload_size, create_image_processing_report
+    IMAGE_UTILS_AVAILABLE = True
+    logger.info("Image compression utilities loaded successfully")
+except ImportError as e:
+    logger.warning(f"Image compression utilities not available: {e}")
+    IMAGE_UTILS_AVAILABLE = False
+
 
 @dataclass
 class ContextConfig:
@@ -798,11 +807,47 @@ class ImageModalProcessor(BaseModalProcessor):
         super().__init__(lightrag, modal_caption_func, context_extractor)
 
     def _encode_image_to_base64(self, image_path: str) -> str:
-        """Encode image to base64"""
+        """
+        Encode image to base64 with intelligent compression to prevent payload size issues
+        
+        This method now includes:
+        1. Size validation before encoding
+        2. Automatic compression if needed
+        3. Fallback to original method if compression utils unavailable
+        """
         try:
+            # Use new compression utilities if available
+            if IMAGE_UTILS_AVAILABLE:
+                logger.debug(f"Using intelligent compression for image: {image_path}")
+                
+                # Attempt compression with size control
+                compressed_base64 = validate_and_compress_image(
+                    image_path, 
+                    max_size_kb=200,  # Target 200KB max for API calls
+                    max_dimension=1024  # Max dimension for efficiency
+                )
+                
+                if compressed_base64:
+                    # Log processing success
+                    size_kb = len(compressed_base64) / 1024
+                    logger.info(f"Image successfully compressed: {image_path} -> {size_kb:.1f}KB")
+                    return compressed_base64
+                else:
+                    logger.warning(f"Image compression failed, falling back to original method: {image_path}")
+            
+            # Fallback to original method
+            logger.debug(f"Using original encoding method for: {image_path}")
             with open(image_path, "rb") as image_file:
                 encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+                
+            # Check size and warn if potentially problematic
+            size_kb = len(encoded_string) / 1024
+            if size_kb > 300:  # Warn for potentially large payloads
+                logger.warning(f"Large base64 payload detected: {size_kb:.1f}KB for {image_path}")
+                logger.warning("This may cause API failures. Consider implementing image compression.")
+            
             return encoded_string
+            
         except Exception as e:
             logger.error(f"Failed to encode image {image_path}: {e}")
             return ""
@@ -898,16 +943,61 @@ class ImageModalProcessor(BaseModalProcessor):
             return enhanced_caption, entity_info
 
         except Exception as e:
-            logger.error(f"Error generating image description: {e}")
-            # Fallback processing
-            fallback_entity = {
-                "entity_name": entity_name
-                if entity_name
-                else f"image_{compute_mdhash_id(str(modal_content))}",
-                "entity_type": "image",
-                "summary": f"Image content: {str(modal_content)[:100]}",
-            }
-            return str(modal_content), fallback_entity
+            error_str = str(e)
+            logger.error(f"Error generating image description: {error_str}")
+            
+            # Enhanced error handling with payload size detection
+            fallback_summary = f"Image content: {str(modal_content)[:100]}"
+            
+            # Check if it's a payload size related error
+            if any(indicator in error_str.lower() for indicator in [
+                "failed to deserialize", "364954", "column 364954", 
+                "payload too large", "request entity too large",
+                "json body", "untagged enum chatcompletionrequestcontent"
+            ]):
+                logger.error(f"Detected large payload error for image: {image_path}")
+                logger.error("This is likely due to oversized base64 image data")
+                
+                # Try to provide more specific fallback information
+                try:
+                    if os.path.exists(image_path):
+                        file_size_kb = os.path.getsize(image_path) / 1024
+                        logger.error(f"Original image file size: {file_size_kb:.1f}KB")
+                        
+                        # Create a more informative fallback
+                        captions = modal_content.get("img_caption", []) if isinstance(modal_content, dict) else []
+                        if captions:
+                            fallback_summary = f"Large image file ({file_size_kb:.1f}KB) with captions: {', '.join(captions[:3])}"
+                        else:
+                            fallback_summary = f"Large image file ({file_size_kb:.1f}KB) - processing failed due to size constraints"
+                            
+                    else:
+                        fallback_summary = "Large image file - processing failed due to API payload size limits"
+                        
+                except Exception as size_error:
+                    logger.debug(f"Could not get file size info: {size_error}")
+                    fallback_summary = "Image processing failed due to payload size constraints"
+                    
+                # Create fallback entity with size issue indication
+                fallback_entity = {
+                    "entity_name": entity_name if entity_name else f"large_image_{compute_mdhash_id(str(modal_content))}",
+                    "entity_type": "image",
+                    "summary": fallback_summary,
+                    "processing_notes": "Vision processing failed due to image size constraints",
+                    "error_category": "payload_size_limit"
+                }
+                
+            else:
+                # Standard error fallback
+                fallback_entity = {
+                    "entity_name": entity_name if entity_name else f"image_{compute_mdhash_id(str(modal_content))}",
+                    "entity_type": "image",
+                    "summary": fallback_summary,
+                    "processing_notes": f"Vision processing failed: {error_str[:100]}",
+                    "error_category": "vision_processing_error"
+                }
+            
+            return fallback_summary, fallback_entity
 
     async def process_multimodal_content(
         self,

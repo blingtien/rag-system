@@ -1,0 +1,91 @@
+{
+  "summary": {
+    "total_documents": 29,
+    "successful_documents": 20,
+    "failed_documents": 2,
+    "recoverable_documents": 7
+  },
+  "failed_docs": [
+    {
+      "doc_id": "doc-ed6b34ddffe525fc2be3897c09418e75",
+      "file_name": "国家电网公司电网设备消防管理规定_1406604299854_converted.docx",
+      "status": "failed",
+      "has_parsing_output": false,
+      "chunk_count": 0,
+      "error": "No parsing output found - requires re-parsing"
+    },
+    {
+      "doc_id": "doc-4ab4c46ec8356bddadcc19073955b320",
+      "file_name": "test_persistence.txt",
+      "status": "failed",
+      "has_parsing_output": false,
+      "chunk_count": 0,
+      "error": "No parsing output found - requires re-parsing"
+    }
+  ],
+  "recoverable_docs": [
+    {
+      "doc_id": "doc-46a772292b9dce85e321b5d4e9579024",
+      "file_name": "国网河南省电力公司总经理办公会议规则2024.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国网河南省电力公司总经理办公会议规则\n\n第一条 为规范国网河南省电力公司（以下简称“公司”）经理层行使职权、履行职责的行为，根据国家有关法律、行政法规和《国网河南省电力公司章程》，制定本规则。\n\n第二条 公司经理层依法依章程行权履职，维护党委的领导作用，对董事会负责，维护出资人和公司利益。",
+      "error": "Document content not found in full_docs for doc_id: doc-46a772292b9dce85e321b5d4e9579024"
+    },
+    {
+      "doc_id": "doc-7d9f4f112cdf14d60a4758c49f04f297",
+      "file_name": "国家电网有限公司劳动合同管理办法_1534491720240.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 2,
+      "content_summary": "国家电网有限公司劳动合同管理办法\n\n第一条 为依法构建和谐稳定的劳动关系，规范劳动合同管理，维护用人单位和员工的合法权益，依据《中华人民共和国劳动法》《中华人民共和国劳动合同法》（以下简称《劳动合同法》）《中华人民共和国劳动合同法实施条例》及相关法律法规和国家政策，结合国家电网有限公司（以下简称“公司”）实际，制定本办法。\n\n第二条 本办法所称的用人单位是指具有用人权利能力和用人行为能力，配置运用劳动力、组织员工进行生产活动，并向员工支付劳动报酬的法人单位或其分支机构；本办法所称的员工是指经公司核准，在公司系统各级单位工作，并由其直接支付工资的人员，不包括聘用的离退休等其他从业人员。",
+      "error": "Document content not found in full_docs for doc_id: doc-7d9f4f112cdf14d60a4758c49f04f297"
+    },
+    {
+      "doc_id": "doc-31b9b4ff2c8a93b9ab03f80b7f54d8db",
+      "file_name": "国家电网有限公司内部人力资源市场管理办法_1645167940329 (1).pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国家电网有限公司内部人力资源市场管理办法\n\n第一条 为进一步深化国家电网有限公司（以下简称“公司”）内部人力资源市场（以下简称“内部市场”）建设，促进人力资源优化配置和高效利用，结合公司实际，制定本办法。\n\n第二条 本办法所称内部市场是指在公司范围内,以人力资源配置“高质量、高效率”为目标，通过人力资源供需平台，运用组织行为或市场化机制开展员工流动，盘活存量，优化配置，促进人力资源高效利用，实现供需平衡的内部机构、场所及相关活动的总和。",
+      "error": "Document content not found in full_docs for doc_id: doc-31b9b4ff2c8a93b9ab03f80b7f54d8db"
+    },
+    {
+      "doc_id": "doc-c69f1d6cb15824ce6b877bca1685056b",
+      "file_name": "国家电网有限公司教育培训项目管理办法_1665211250930.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国家电网有限公司教育培训项目管理办法\n\n第一条 为深入落实国家电网有限公司（以下简称“公司”） 发展战略，规范教育培训项目管理，提升培训质效和职工教育培训经费（以下简称“职教经费”）使用效益，依据国家有关法律法规、国家标准，以及公司教育培训、综合计划和全面预算等管理制度，制定本办法。\n\n第二条 本办法所称教育培训项目（以下简称“项目”），是指为持续提升职工队伍素质而开展的职工培训、人才评价、培训开发和培训购置等项目，是职工教育培训各项工作的载体。教育培训项目经费来源于（或占用）依法计提、并在成本中列支的职教经费。",
+      "error": "Document content not found in full_docs for doc_id: doc-c69f1d6cb15824ce6b877bca1685056b"
+    },
+    {
+      "doc_id": "doc-971f3364aa536b2e9ecafea441a58fab",
+      "file_name": "国家电网有限公司教育培训管理规定_1558177436739.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国家电网有限公司教育培训管理规定\n\n第一条 为大力实施人才强企战略，全面加强国家电网有限公司（以下简称“公司”）职工教育培训工作，不断提升培训组织和职工发展活力，培养造就一支知识型、技能型、创新型劳动者大军，为公司可持续发展提供坚强人才保障，根据《中华人民共和国职业教育法》、《关于推行终身职业技能培训制度的意见》（国发〔2018〕11 号）等政策及公司有关规定，制定本规定。\n\n第二条 公司依法承担为职工提供教育培训的义务；职工依法享有接受教育培训的权利，同时具有不断提高自身职业技能满足岗位工作需要的义务。",
+      "error": "Document content not found in full_docs for doc_id: doc-971f3364aa536b2e9ecafea441a58fab"
+    },
+    {
+      "doc_id": "doc-b2fb54520a181909b83140dbaf7f533d",
+      "file_name": "国家电网有限公司网络学习管理办法_1665211507961.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国家电网有限公司网络学习管理办法\n\n第一条 为全面落实人才强企战略，加快推动国家电网有限公司（以下简称“公司”）教育培训数字化转型和网络学习高质量发展，提高公司内部知识传播力、共享度和学习活动吸引力，激发员工创新创造能力，提升组织发展活力，为公司实现战略目标和可持续发展提供坚强人才保障，依据国家职业教育法律法规和公司教育培训有关规定，制订本办法。\n\n第二条 网络学习管理坚持“战略引领、专业负责，统一平台、共创共享，分级组织、全员覆盖”原则。网络学习主要依托公司统一建设的国网学堂开展，国网学堂设专业专区和省直专区，是宣传党和国家方针政策、法律法规和公司发展战略、企业文化以及规章制度的重要窗口，推广应用新理论、新知识、新技术、新方法的主要平台，各级单位实施培训考试、知识共享、资质认证等活动的统一载体，员工自主提升知识水平、业务能力的重要渠道。",
+      "error": "Document content not found in full_docs for doc_id: doc-b2fb54520a181909b83140dbaf7f533d"
+    },
+    {
+      "doc_id": "doc-e3839963a33571bb53650c50411ea7b1",
+      "file_name": "国家电网有限公司企业年金管理办法_1644559838997.pdf",
+      "status": "failed",
+      "has_parsing_output": true,
+      "chunk_count": 0,
+      "content_summary": "国家电网有限公司企业年金管理办法\n\n第一条 为进一步完善国家电网有限公司(以下简称“公司”)养老保障制度，建立与现代企业制度相适应的多层次养老保险体系，提高职工退休后的待遇水平，调动职工工作积极性，增强企业凝聚力，促进企业可持续发展，根据《企业年金办法》（人力资源和社会保障部令第36号）、《企业年金基金管理办法》（人力资源和社会保障部令第11号）、《关于中央企业规范实施企业年金的意见》（国资发考分〔2018〕76号）等政策法规，结合\n\n第二条 本办法所称企业年金，是指单位及其职工按照国家政策规定，在依法参加基本养老保险的基础上， 自主建立的补充养老保险制度。",
+      "error": "Document content not found in full_docs for doc_id: doc-e3839963a33571bb53650c50411ea7b1"
+    }
+  ]
+}

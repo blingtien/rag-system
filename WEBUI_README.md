@@ -91,8 +91,8 @@ npm run dev
 
 ### 访问地址
 - **Web界面**：http://localhost:3000
-- **API文档**：http://localhost:8000/docs
-- **API健康检查**：http://localhost:8000/health
+- **API文档**：http://localhost:8001/docs
+- **API健康检查**：http://localhost:8001/health
 
 ## 📖 使用指南
 
@@ -137,14 +137,14 @@ import requests
 
 # 上传文档
 files = {'file': open('document.pdf', 'rb')}
-response = requests.post('http://localhost:8000/api/documents/upload', files=files)
+response = requests.post('http://localhost:8001/api/v1/documents/upload', files=files)
 
 # 执行查询
 query_data = {
     "query": "文档的主要内容是什么？",
     "mode": "hybrid"
 }
-response = requests.post('http://localhost:8000/api/query', json=query_data)
+response = requests.post('http://localhost:8001/api/v1/query', json=query_data)
 ```
 
 ## 🎨 界面预览
@@ -176,7 +176,7 @@ response = requests.post('http://localhost:8000/api/query', json=query_data)
 ```bash
 # API配置
 API_HOST=0.0.0.0
-API_PORT=8000
+API_PORT=8001
 
 # RAG系统配置
 WORKING_DIR=./rag_storage
@@ -201,7 +201,7 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: 'http://your-api-server:8000/api/:path*',
+        destination: 'http://your-api-server:8001/api/:path*',
       },
     ];
   },

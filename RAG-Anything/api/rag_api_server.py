@@ -12,7 +12,7 @@ import uuid
 import psutil
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import sys
 
@@ -22,8 +22,16 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+# V2 批量处理架构导入
+try:
+    from batch_processing_v2 import create_batch_processor_v2
+    V2_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"V2批量处理模块导入失败: {e}")
+    V2_AVAILABLE = False
+
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -50,6 +58,13 @@ from cache_statistics import initialize_cache_tracking, get_cache_stats_tracker
 # 导入增强的错误处理和进度跟踪
 from enhanced_error_handler import enhanced_error_handler
 from advanced_progress_tracker import advanced_progress_tracker
+# 导入安全文件处理器
+from utils.secure_file_handler import get_secure_file_handler
+# 导入高性能批处理器和内存管理器
+from processing.concurrent_batch_processor import get_batch_processor
+from memory.memory_manager import get_memory_manager
+# 导入简化认证机制
+from auth.simple_auth import get_current_user_optional, get_current_user_required, get_auth
 
 # 加载环境变量
 load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)
@@ -60,31 +75,52 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="RAG-Anything API", version="1.0.0")
 
-# 启用CORS
+# 安全的CORS配置（本地使用）
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",  # 前端开发服务器
+    "http://127.0.0.1:3000",  # 本地访问变体
+    "http://localhost:5173",  # Vite开发服务器
+    "http://127.0.0.1:5173",  # Vite本地访问变体
+]
+
+# 从环境变量添加额外的允许源
+if os.getenv("ADDITIONAL_CORS_ORIGINS"):
+    additional_origins = os.getenv("ADDITIONAL_CORS_ORIGINS").split(",")
+    ALLOWED_ORIGINS.extend([origin.strip() for origin in additional_origins])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,  # 明确指定允许的源
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],  # 限制HTTP方法
+    allow_headers=["Authorization", "Content-Type"],  # 限制允许的头部
 )
 
-# 全局变量
+# 全局变量（核心组件）
 rag_instance: Optional[RAGAnything] = None
 cache_enhanced_processor: Optional[CacheEnhancedProcessor] = None
-tasks: Dict[str, dict] = {}
-documents: Dict[str, dict] = {}
+batch_processor_v2: Optional[Any] = None
+
+# WebSocket连接管理（不需要持久化）
 active_websockets: Dict[str, WebSocket] = {}
 processing_log_websockets: List[WebSocket] = []  # 文档解析日志WebSocket连接列表
-batch_operations: Dict[str, dict] = {}  # 批量操作状态跟踪
+
+# 使用内存管理器管理状态（替换直接的全局变量）
+memory_manager = get_memory_manager()
+batch_processor = get_batch_processor()
+
+# 兼容性包装器（逐步迁移旧代码）
+tasks = {}  # 将逐步迁移到memory_manager
+documents = {}  # 将逐步迁移到memory_manager  
+batch_operations = {}  # 将逐步迁移到memory_manager
 
 # 日志显示模式
 class LogDisplayMode(BaseModel):
     mode: str = "summary"  # core_only, summary, detailed, all
     include_debug: bool = False
 
-# 配置 - 统一使用绝对路径，指向RAG-Anything根目录的存储
-UPLOAD_DIR = os.path.abspath("../../uploads")
+# 配置 - 统一使用环境变量和绝对路径
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/ragsvr/projects/ragsystem/uploads")
 WORKING_DIR = os.getenv("WORKING_DIR", "/home/ragsvr/projects/ragsystem/rag_storage")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/home/ragsvr/projects/ragsystem/output")
 
@@ -234,7 +270,7 @@ async def load_existing_documents():
 
 async def initialize_rag():
     """初始化RAG系统和缓存增强处理器"""
-    global rag_instance, cache_enhanced_processor
+    global rag_instance, cache_enhanced_processor, batch_processor_v2
     
     if rag_instance is not None:
         return rag_instance
@@ -363,6 +399,24 @@ async def initialize_rag():
             logger.warning(f"工作目录不一致! API服务器: {WORKING_DIR}, RAGAnything: {rag_instance.working_dir}")
         else:
             logger.info("✓ 工作目录配置一致")
+        
+        # 初始化V2批量处理器
+        if V2_AVAILABLE:
+            try:
+                batch_processor_v2 = create_batch_processor_v2(
+                    documents_store=documents,
+                    tasks_store=tasks,
+                    batch_operations=batch_operations,
+                    cache_enhanced_processor=cache_enhanced_processor,
+                    log_callback=send_processing_log
+                )
+                logger.info("✅ V2批量处理器初始化成功")
+            except Exception as e:
+                logger.error(f"V2批量处理器初始化失败: {str(e)}")
+                batch_processor_v2 = None
+        else:
+            logger.warning("V2批量处理模块不可用，使用原有处理器")
+            batch_processor_v2 = None
         
         return rag_instance
         
@@ -608,6 +662,30 @@ async def get_system_status():
                 "status": "running" if rag_instance else "stopped",
                 "uptime": "实时运行"
             }
+        }
+    }
+
+@app.get("/api/system/auth-status")
+async def get_auth_status(request: Request):
+    """认证状态端点 - 显示当前认证配置"""
+    auth = get_auth()
+    auth_info = auth.get_auth_info()
+    
+    # 检查当前请求是否来自localhost
+    is_localhost = "127.0.0.1" in str(request.client.host) if request.client else False
+    
+    return {
+        "success": True,
+        "auth_config": auth_info,
+        "request_info": {
+            "client_host": str(request.client.host) if request.client else "unknown",
+            "is_localhost": is_localhost,
+            "would_bypass_auth": is_localhost and auth_info["localhost_bypass"]
+        },
+        "usage_info": {
+            "token_required": auth_info["auth_enabled"],
+            "header_format": "Authorization: Bearer <your-token>",
+            "example_curl": f"curl -H 'Authorization: Bearer YOUR_TOKEN' {request.url.replace(path='/api/v1/documents')}"
         }
     }
 
@@ -1241,27 +1319,43 @@ async def send_processing_log(message: str, level: str = "info"):
     pass
 
 @app.post("/api/v1/documents/upload") 
-async def upload_document(file: UploadFile = File(...)):
-    """单文档上传端点 - 保持向后兼容"""
-    # 检查文件名重复
-    existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: str = Depends(get_current_user_optional)
+):
+    """单文档上传端点 - 保持向后兼容，使用安全文件处理器"""
+    # 获取安全文件处理器
+    secure_handler = get_secure_file_handler()
+    
+    # 安全的文件上传处理
+    try:
+        upload_result = await secure_handler.handle_upload(file)
+    except HTTPException:
+        # 重新抛出HTTP异常
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+    
+    # 检查文件名重复（使用安全文件名）
+    existing_docs = [doc for doc in documents.values() 
+                    if doc["file_name"] == upload_result["original_filename"]]
     if existing_docs:
+        # 删除已上传的文件
+        try:
+            os.unlink(upload_result["file_path"])
+        except:
+            pass
         raise HTTPException(
             status_code=400, 
-            detail=f"文件名 '{file.filename}' 已存在，请重命名后再上传"
+            detail=f"文件名 '{upload_result['original_filename']}' 已存在，请重命名后再上传"
         )
     
     task_id = str(uuid.uuid4())
     document_id = str(uuid.uuid4())
     
-    # 保存上传的文件
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        content = await file.read()
-        buffer.write(content)
-    
-    # 获取实际文件大小（确保一致性）
-    actual_file_size = os.path.getsize(file_path)
+    # 使用安全处理的结果
+    file_path = upload_result["file_path"]
+    actual_file_size = upload_result["file_size"]
     
     # 创建任务记录
     task = {
@@ -1270,7 +1364,7 @@ async def upload_document(file: UploadFile = File(...)):
         "stage": "parsing",
         "progress": 0,
         "file_path": file_path,
-        "file_name": file.filename,
+        "file_name": upload_result["original_filename"],
         "file_size": actual_file_size,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
@@ -1301,7 +1395,7 @@ async def upload_document(file: UploadFile = File(...)):
     # 创建文档记录
     document = {
         "document_id": document_id,
-        "file_name": file.filename,
+        "file_name": upload_result["original_filename"],
         "file_path": file_path,
         "file_size": actual_file_size,
         "status": "uploaded",  # 改为uploaded状态，表示已上传但未解析
@@ -1320,14 +1414,20 @@ async def upload_document(file: UploadFile = File(...)):
         "message": "Document uploaded successfully, ready for manual processing", 
         "task_id": task_id,
         "document_id": document_id,
-        "file_name": file.filename,
+        "file_name": upload_result["original_filename"],
         "file_size": actual_file_size,
         "status": "uploaded"
     }
 
 @app.post("/api/v1/documents/upload/batch", response_model=BatchUploadResponse)
-async def upload_documents_batch(files: List[UploadFile] = File(...)):
-    """批量文档上传端点"""
+async def upload_documents_batch(
+    files: List[UploadFile] = File(...),
+    current_user: str = Depends(get_current_user_optional)
+):
+    """批量文档上传端点 - 使用安全文件处理器"""
+    # 获取安全文件处理器
+    secure_handler = get_secure_file_handler()
+    
     batch_operation_id = str(uuid.uuid4())
     uploaded_count = 0
     failed_count = 0
@@ -1347,15 +1447,12 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
     }
     batch_operations[batch_operation_id] = batch_operation
     
-    logger.info(f"开始批量上传 {len(files)} 个文件")
-    await send_processing_log(f"📤 开始批量上传 {len(files)} 个文件", "info")
-    
-    # 支持的文件类型
-    supported_extensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.txt', '.md', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp']
+    logger.info(f"开始安全批量上传 {len(files)} 个文件")
+    await send_processing_log(f"📤 开始安全批量上传 {len(files)} 个文件", "info")
     
     for i, file in enumerate(files):
         file_result = {
-            "file_name": file.filename,
+            "file_name": file.filename if file.filename else f"unknown_file_{i}",
             "file_size": 0,
             "status": "failed",
             "message": "",
@@ -1364,44 +1461,29 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
         }
         
         try:
-            # 文件类型验证
-            file_extension = os.path.splitext(file.filename)[1].lower()
-            if file_extension not in supported_extensions:
-                file_result["message"] = f"不支持的文件类型: {file_extension}"
-                failed_count += 1
-                results.append(file_result)
-                batch_operation["failed_items"] += 1
-                continue
+            # 使用安全文件处理器进行上传处理
+            upload_result = await secure_handler.handle_upload(file)
             
-            # 检查文件大小（限制100MB）
-            content = await file.read()
-            file_size = len(content)
-            if file_size > 100 * 1024 * 1024:  # 100MB
-                file_result["message"] = "文件大小超过100MB限制"
-                failed_count += 1
-                results.append(file_result)
-                batch_operation["failed_items"] += 1
-                continue
-                
-            # 检查文件名重复
-            existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
+            # 检查文件名重复（使用原始文件名）
+            existing_docs = [doc for doc in documents.values() 
+                           if doc["file_name"] == upload_result["original_filename"]]
             if existing_docs:
+                # 删除已上传的文件
+                try:
+                    os.unlink(upload_result["file_path"])
+                except:
+                    pass
                 file_result["message"] = "文件名重复，已跳过"
                 failed_count += 1
                 results.append(file_result)
                 batch_operation["failed_items"] += 1
                 continue
             
-            # 保存文件
+            # 创建任务和文档记录
             task_id = str(uuid.uuid4())
             document_id = str(uuid.uuid4())
-            file_path = os.path.join(UPLOAD_DIR, file.filename)
-            
-            with open(file_path, "wb") as buffer:
-                buffer.write(content)
-            
-            # 获取实际文件大小
-            actual_file_size = os.path.getsize(file_path)
+            file_path = upload_result["file_path"]
+            actual_file_size = upload_result["file_size"]
             
             # 创建任务记录
             task = {
@@ -1410,7 +1492,7 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
                 "stage": "parsing",
                 "progress": 0,
                 "file_path": file_path,
-                "file_name": file.filename,
+                "file_name": upload_result["original_filename"],
                 "file_size": actual_file_size,
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
@@ -1442,7 +1524,7 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
             # 创建文档记录
             document = {
                 "document_id": document_id,
-                "file_name": file.filename,
+                "file_name": upload_result["original_filename"],
                 "file_path": file_path,
                 "file_size": actual_file_size,
                 "status": "uploaded",
@@ -1467,6 +1549,13 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
             batch_operation["completed_items"] += 1
             results.append(file_result)
             
+        except HTTPException as e:
+            # HTTP异常包含了安全验证失败的详细信息
+            file_result["message"] = e.detail
+            failed_count += 1
+            batch_operation["failed_items"] += 1
+            results.append(file_result)
+            logger.warning(f"安全验证失败文件 {file.filename}: {e.detail}")
         except Exception as e:
             file_result["message"] = f"上传失败: {str(e)}"
             failed_count += 1
@@ -1554,6 +1643,15 @@ async def process_documents_batch(request: BatchProcessRequest):
     started_count = 0
     failed_count = 0
     results = []
+    
+    # Initialize cache_metrics to prevent UnboundLocalError
+    cache_metrics = {
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_hit_ratio": 0.0,
+        "total_time_saved": 0.0,
+        "efficiency_improvement": 0.0
+    }
     
     # 创建批量操作状态跟踪
     batch_operation = {
@@ -1712,7 +1810,10 @@ async def process_documents_batch(request: BatchProcessRequest):
             rag_results = batch_result.get("rag_results", {})
             successful_rag_files = batch_result.get("successful_rag_files", 0)
             processing_time = batch_result.get("total_processing_time", 0)
-            cache_metrics = batch_result.get("cache_metrics", {})
+            # Update cache_metrics with actual results, keeping defaults if not available
+            batch_cache_metrics = batch_result.get("cache_metrics", {})
+            if batch_cache_metrics:
+                cache_metrics.update(batch_cache_metrics)
             
             # 映射文件路径到文档ID
             path_to_doc = {doc_info["document"]["file_path"]: doc_info for doc_info in valid_documents}
@@ -2387,6 +2488,174 @@ async def clear_documents():
         "details": clear_results
     }
 
+@app.get("/api/v1/documents/scan-uploads-folder")
+async def scan_uploads_folder():
+    """扫描uploads文件夹，发现未处理的文件"""
+    try:
+        upload_dir = os.getenv("UPLOAD_DIR", "/home/ragsvr/projects/ragsystem/uploads")
+        
+        # 支持的文件扩展名
+        supported_extensions = {
+            '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
+            '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp',
+            '.txt', '.md'
+        }
+        
+        # 扫描uploads文件夹
+        found_files = []
+        if os.path.exists(upload_dir):
+            for root, dirs, files in os.walk(upload_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    file_ext = os.path.splitext(file.lower())[1]
+                    
+                    if file_ext in supported_extensions:
+                        file_size = os.path.getsize(file_path)
+                        file_stat = os.stat(file_path)
+                        modified_time = datetime.fromtimestamp(file_stat.st_mtime)
+                        
+                        found_files.append({
+                            'file_name': file,
+                            'file_path': file_path,
+                            'file_size': file_size,
+                            'modified_time': modified_time.isoformat(),
+                            'extension': file_ext
+                        })
+        
+        # 获取已知文档列表
+        existing_filenames = set()
+        for doc in documents.values():
+            existing_filenames.add(doc.get('file_name', ''))
+        
+        # 找出未处理的文件
+        unprocessed_files = []
+        for file_info in found_files:
+            if file_info['file_name'] not in existing_filenames:
+                unprocessed_files.append({
+                    'file_name': file_info['file_name'],
+                    'file_path': file_info['file_path'],
+                    'file_size': file_info['file_size'],
+                    'file_size_display': format_file_size(file_info['file_size']),
+                    'modified_time': file_info['modified_time'],
+                    'extension': file_info['extension']
+                })
+        
+        return {
+            'success': True,
+            'scanned_files': len(found_files),
+            'unprocessed_files': len(unprocessed_files),
+            'unprocessed_file_list': unprocessed_files,
+            'message': f'扫描完成：发现 {len(found_files)} 个文件，其中 {len(unprocessed_files)} 个未处理'
+        }
+        
+    except Exception as e:
+        logger.error(f"扫描uploads文件夹失败: {e}")
+        return {
+            'success': False,
+            'scanned_files': 0,
+            'unprocessed_files': 0,
+            'unprocessed_file_list': [],
+            'message': f'扫描失败: {str(e)}'
+        }
+
+@app.post("/api/v1/documents/process-unprocessed-files")
+async def process_unprocessed_files(request: dict):
+    """批量处理uploads文件夹中未处理的文件"""
+    try:
+        # 先扫描获取未处理文件 
+        scan_response = await scan_uploads_folder()
+        
+        if not scan_response['success'] or scan_response['unprocessed_files'] == 0:
+            return {
+                'success': True,
+                'added_count': 0,
+                'message': '没有发现未处理的文件'
+            }
+        
+        unprocessed_files = scan_response['unprocessed_file_list']
+        added_documents = []
+        failed_files = []
+        
+        # 为每个未处理文件创建文档记录
+        for file_info in unprocessed_files:
+            try:
+                document_id = str(uuid.uuid4())
+                task_id = str(uuid.uuid4())
+                
+                # 创建文档记录
+                document = {
+                    "document_id": document_id,
+                    "file_name": file_info['file_name'],
+                    "file_path": file_info['file_path'],  
+                    "file_size": file_info['file_size'],
+                    "status": "uploaded",
+                    "created_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat(),
+                    "task_id": task_id
+                }
+                
+                # 添加到内存存储
+                documents[document_id] = document
+                
+                # 创建任务记录
+                tasks[task_id] = {
+                    "task_id": task_id,
+                    "document_id": document_id,
+                    "status": "pending",
+                    "file_name": file_info['file_name'],
+                    "created_at": datetime.now().isoformat(),
+                    "progress": 0,
+                    "stage": "等待处理"
+                }
+                
+                added_documents.append({
+                    'document_id': document_id,
+                    'file_name': file_info['file_name'],
+                    'file_size': file_info['file_size'],
+                    'task_id': task_id
+                })
+                
+            except Exception as e:
+                logger.error(f"添加文件失败 {file_info['file_name']}: {e}")
+                failed_files.append({
+                    'file_name': file_info['file_name'],
+                    'error': str(e)
+                })
+        
+        # 保存状态
+        save_documents_state()
+        
+        return {
+            'success': True,
+            'added_count': len(added_documents),
+            'failed_count': len(failed_files),
+            'total_files': len(unprocessed_files),
+            'added_documents': added_documents,
+            'failed_files': failed_files,
+            'message': f'成功添加 {len(added_documents)} 个文件到处理队列'
+        }
+        
+    except Exception as e:
+        logger.error(f"批量处理失败: {e}")
+        return {
+            'success': False,
+            'added_count': 0,
+            'failed_count': 0,
+            'total_files': 0,
+            'message': f'批量处理失败: {str(e)}'
+        }
+
+def format_file_size(size_bytes: int) -> str:
+    """格式化文件大小显示"""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
 @app.websocket("/ws/task/{task_id}")
 async def websocket_task_endpoint(websocket: WebSocket, task_id: str):
     """任务进度WebSocket端点"""
@@ -2462,6 +2731,44 @@ async def get_batch_operation_status(batch_operation_id: str):
         completed_at=batch_operation.get("completed_at"),
         results=batch_operation.get("results", [])
     )
+
+# V2 批量处理端点 - 新架构
+@app.post("/api/v1/documents/process/batch/v2", response_model=BatchProcessResponse)
+async def process_documents_batch_v2(request: BatchProcessRequest):
+    """V2批量文档处理端点 - 使用新架构解决cache_metrics等问题
+    
+    主要改进:
+    1. 所有变量都有默认初始化，避免UnboundLocalError
+    2. 职责清晰分离，每个组件单一职责
+    3. 统一的错误处理和状态恢复机制
+    4. 类型安全的数据结构
+    """
+    global batch_processor_v2
+    
+    # 检查V2处理器是否可用
+    if not batch_processor_v2:
+        # 尝试初始化V2处理器
+        await initialize_rag()
+        if not batch_processor_v2:
+            # 如果V2不可用，回退到V1端点
+            logger.warning("V2批量处理器不可用，回退到V1端点")
+            return await process_documents_batch(request)
+    
+    try:
+        # 使用V2架构处理批量请求
+        result = await batch_processor_v2.process_documents_batch_v2(
+            document_ids=request.document_ids,
+            parser=request.parser or "mineru",
+            parse_method=request.parse_method or "auto"
+        )
+        
+        # 转换为标准响应格式
+        return BatchProcessResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"V2批量处理失败，回退到V1: {str(e)}")
+        # 如果V2失败，回退到V1端点
+        return await process_documents_batch(request)
 
 @app.get("/api/v1/batch-operations")
 async def list_batch_operations(limit: int = 50, status: Optional[str] = None):
