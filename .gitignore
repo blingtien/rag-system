@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Uploads and output
+uploads/
+output/
+rag_storage/
+
+# Node modules
+node_modules/
+
+# Claude Code PM (optional - keep local)
+.claude/epics/
+.claude/context/
+
+# Screenshots
+*.webp
+*.png
+*.jpg
+LightRAG/
