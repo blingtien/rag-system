@@ -1,0 +1,896 @@
+openapi: 3.0.3
+info:
+  title: RAG-Anything API
+  description: |
+    Comprehensive REST API for RAG-Anything document processing and query system.
+    
+    Features:
+    - Document upload and processing with multiple parsers
+    - Batch operations with real-time progress tracking
+    - Query RAG system with multiple modes
+    - WebSocket support for live updates
+    - Advanced caching and performance monitoring
+    - System health and statistics
+    
+    ## Key Capabilities
+    - **Smart Document Processing**: Automatic parser selection (MinerU, Docling, Direct Text)
+    - **Batch Operations**: Efficient batch processing with concurrent handling
+    - **Real-time Updates**: WebSocket streaming for progress and logs
+    - **Cache Management**: Advanced caching with performance analytics
+    - **System Monitoring**: Comprehensive health and performance metrics
+    
+  version: 1.0.0
+  contact:
+    name: RAG-Anything API Support
+    url: https://github.com/your-org/rag-anything
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: Development server
+  - url: http://127.0.0.1:8001
+    description: Alternative development server
+
+tags:
+  - name: Health
+    description: System health and status endpoints
+  - name: Documents
+    description: Document upload and management
+  - name: Processing
+    description: Document processing operations
+  - name: Batch
+    description: Batch operations and progress tracking
+  - name: Tasks
+    description: Task management and monitoring
+  - name: Query
+    description: RAG query operations
+  - name: Logs
+    description: Logging and monitoring
+  - name: Cache
+    description: Cache management and statistics
+  - name: Testing
+    description: Testing and debugging endpoints
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Basic health check
+      description: Returns basic service health status and statistics
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service is unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/system/status:
+    get:
+      tags: [Health]
+      summary: Extended system status
+      description: Returns detailed system metrics and service status
+      operationId: getSystemStatus
+      responses:
+        '200':
+          description: System status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemStatusResponse'
+
+  /api/v1/documents/upload:
+    post:
+      tags: [Documents]
+      summary: Upload single document
+      description: Upload a single document for processing
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file to upload
+              required:
+                - file
+      responses:
+        '200':
+          description: Document uploaded successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentUploadResponse'
+        '400':
+          description: Invalid file or file already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/documents/upload/batch:
+    post:
+      tags: [Documents]
+      summary: Batch document upload
+      description: Upload multiple documents in a single request
+      operationId: uploadDocumentsBatch
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: Array of document files to upload
+              required:
+                - files
+      responses:
+        '200':
+          description: Batch upload completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchUploadResponse'
+
+  /api/v1/documents:
+    get:
+      tags: [Documents]
+      summary: List documents
+      description: Get list of all documents with status and metadata
+      operationId: listDocuments
+      responses:
+        '200':
+          description: Document list retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+
+    delete:
+      tags: [Documents]
+      summary: Delete multiple documents
+      description: Delete specified documents and their RAG data
+      operationId: deleteDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentDeleteRequest'
+      responses:
+        '200':
+          description: Documents deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentDeleteResponse'
+
+  /api/v1/documents/{document_id}/process:
+    post:
+      tags: [Processing]
+      summary: Process document manually
+      description: Manually trigger processing for an uploaded document
+      operationId: processDocument
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Document ID to process
+      responses:
+        '200':
+          description: Document processing started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessStartResponse'
+        '404':
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/documents/process/batch:
+    post:
+      tags: [Batch]
+      summary: Batch document processing
+      description: Process multiple documents using advanced batch processing
+      operationId: batchProcessDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchProcessRequest'
+      responses:
+        '200':
+          description: Batch processing started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchProcessResponse'
+        '500':
+          description: Batch processing failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchErrorResponse'
+
+  /api/v1/query:
+    post:
+      tags: [Query]
+      summary: Query RAG system
+      description: Query the RAG system for information from processed documents
+      operationId: queryDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+      responses:
+        '200':
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+        '400':
+          description: Invalid query request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/tasks:
+    get:
+      tags: [Tasks]
+      summary: List all tasks
+      description: Get list of all processing tasks with status
+      operationId: listTasks
+      responses:
+        '200':
+          description: Task list retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskListResponse'
+
+  /api/v1/tasks/{task_id}:
+    get:
+      tags: [Tasks]
+      summary: Get task details
+      description: Get details for a specific task
+      operationId: getTask
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Task ID to retrieve
+      responses:
+        '200':
+          description: Task details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '404':
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/tasks/{task_id}/cancel:
+    post:
+      tags: [Tasks]
+      summary: Cancel task
+      description: Cancel a running task
+      operationId: cancelTask
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Task ID to cancel
+      responses:
+        '200':
+          description: Task cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/v1/cache/statistics:
+    get:
+      tags: [Cache]
+      summary: Get cache statistics
+      description: Get comprehensive cache performance statistics
+      operationId: getCacheStatistics
+      responses:
+        '200':
+          description: Cache statistics retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheStatisticsResponse'
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          example: healthy
+        message:
+          type: string
+          example: "RAG-Anything API is running"
+        version:
+          type: string
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+        services:
+          type: object
+          properties:
+            rag_engine:
+              type: string
+              enum: [healthy, unhealthy]
+            tasks:
+              type: string
+              enum: [healthy, unhealthy]
+            documents:
+              type: string
+              enum: [healthy, unhealthy]
+        statistics:
+          type: object
+          properties:
+            active_tasks:
+              type: integer
+              minimum: 0
+            total_tasks:
+              type: integer
+              minimum: 0
+            total_documents:
+              type: integer
+              minimum: 0
+        system_checks:
+          type: object
+          properties:
+            api:
+              type: boolean
+            websocket:
+              type: boolean
+            storage:
+              type: boolean
+            rag_initialized:
+              type: boolean
+
+    SystemStatusResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        status:
+          type: string
+          enum: [healthy, degraded]
+        timestamp:
+          type: string
+          format: date-time
+        metrics:
+          type: object
+          properties:
+            cpu_usage:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 100
+            memory_usage:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 100
+            disk_usage:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 100
+            gpu_usage:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 100
+        processing_stats:
+          type: object
+          properties:
+            documents_processed:
+              type: integer
+            entities_count:
+              type: integer
+            relationships_count:
+              type: integer
+            chunks_count:
+              type: integer
+
+    DocumentUploadResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Document uploaded successfully, ready for manual processing"
+        task_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+          example: "document.pdf"
+        file_size:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: [uploaded, processing, completed, failed]
+
+    BatchUploadResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        uploaded_count:
+          type: integer
+          minimum: 0
+        failed_count:
+          type: integer
+          minimum: 0
+        total_files:
+          type: integer
+          minimum: 0
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileUploadResult'
+        message:
+          type: string
+
+    FileUploadResult:
+      type: object
+      properties:
+        file_name:
+          type: string
+        file_size:
+          type: integer
+        status:
+          type: string
+          enum: [success, failed]
+        message:
+          type: string
+        task_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+
+    DocumentListResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentInfo'
+        total_count:
+          type: integer
+        status_counts:
+          type: object
+          properties:
+            uploaded:
+              type: integer
+            processing:
+              type: integer
+            completed:
+              type: integer
+            failed:
+              type: integer
+
+    DocumentInfo:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+        file_size:
+          type: integer
+        uploaded_at:
+          type: string
+          format: date-time
+        status_code:
+          type: string
+          enum: [uploaded, processing, completed, failed]
+        status_display:
+          type: string
+        action_type:
+          type: string
+          enum: [start_processing, processing, completed, retry, unknown]
+        can_process:
+          type: boolean
+        progress_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+
+    BatchProcessRequest:
+      type: object
+      required:
+        - document_ids
+      properties:
+        document_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+        parser:
+          type: string
+          enum: [mineru, docling, direct_text]
+          description: Specific parser to use (optional)
+        parse_method:
+          type: string
+          enum: [auto, ocr, text]
+          description: Parsing method (optional)
+
+    BatchProcessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        started_count:
+          type: integer
+        failed_count:
+          type: integer
+        total_requested:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessResult'
+        batch_operation_id:
+          type: string
+          format: uuid
+        message:
+          type: string
+        cache_performance:
+          $ref: '#/components/schemas/CachePerformance'
+
+    ProcessResult:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+        status:
+          type: string
+          enum: [success, failed]
+        message:
+          type: string
+        task_id:
+          type: string
+          format: uuid
+
+    QueryRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Query text to search for
+        mode:
+          type: string
+          enum: [local, global, hybrid]
+          default: hybrid
+          description: Query mode to use
+        vlm_enhanced:
+          type: boolean
+          default: false
+          description: Enable vision-language model enhancement
+
+    QueryResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        query:
+          type: string
+        mode:
+          type: string
+        result:
+          type: string
+          description: Query result text
+        timestamp:
+          type: string
+          format: date-time
+        processing_time:
+          type: number
+          format: float
+        sources:
+          type: array
+          items:
+            type: string
+          description: Source document references
+        metadata:
+          type: object
+          properties:
+            total_documents:
+              type: integer
+            tokens_used:
+              type: integer
+            confidence_score:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+
+    TaskListResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+        total_count:
+          type: integer
+        active_tasks:
+          type: integer
+
+    Task:
+      type: object
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        stage:
+          type: string
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        file_path:
+          type: string
+        file_name:
+          type: string
+        file_size:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        document_id:
+          type: string
+          format: uuid
+
+    TaskResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        task:
+          $ref: '#/components/schemas/Task'
+
+    DocumentDeleteRequest:
+      type: object
+      required:
+        - document_ids
+      properties:
+        document_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+
+    DocumentDeleteResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        deleted_count:
+          type: integer
+        deletion_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeletionResult'
+
+    DeletionResult:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        file_name:
+          type: string
+        status:
+          type: string
+          enum: [success, error, not_found]
+        message:
+          type: string
+        details:
+          type: object
+
+    ProcessStartResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        document_id:
+          type: string
+          format: uuid
+        task_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+
+    CacheStatisticsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        timestamp:
+          type: string
+          format: date-time
+        statistics:
+          $ref: '#/components/schemas/CacheStatistics'
+
+    CacheStatistics:
+      type: object
+      properties:
+        overall_statistics:
+          type: object
+          properties:
+            total_operations:
+              type: integer
+            hit_ratio_percent:
+              type: number
+              format: float
+            total_time_saved_seconds:
+              type: number
+              format: float
+            efficiency_improvement_percent:
+              type: number
+              format: float
+        cache_health:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [healthy, warning, error]
+
+    CachePerformance:
+      type: object
+      properties:
+        cache_hits:
+          type: integer
+        cache_misses:
+          type: integer
+        cache_hit_ratio:
+          type: number
+          format: float
+        total_time_saved:
+          type: number
+          format: float
+        efficiency_improvement:
+          type: number
+          format: float
+
+    BatchErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        error_category:
+          type: string
+        error_severity:
+          type: string
+        is_recoverable:
+          type: boolean
+        suggested_solution:
+          type: string
+        system_warnings:
+          type: array
+          items:
+            type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          description: Error message
+        detail:
+          type: string
+          description: Detailed error information
+        timestamp:
+          type: string
+          format: date-time
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT authentication (not currently implemented)
+
+# Currently no authentication required
+security: []
+
+externalDocs:
+  description: RAG-Anything Documentation
+  url: https://github.com/your-org/rag-anything/docs
