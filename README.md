@@ -87,58 +87,53 @@ ragsystem/
 
 ### 环境要求
 - Python 3.9+
-- Node.js 16+
-- PostgreSQL 13+ (with pgvector)
-- Neo4j 5.0+
+- Node.js 16+ (可选，用于前端)
 - Docker & Docker Compose
+- Git
 
-### 安装部署
+### ⚡ 一键启动
 
 1. **克隆项目**
 ```bash
-git clone https://github.com/blingtien/ragsystem.git
-cd ragsystem
+git clone https://github.com/blingtien/rag-system.git
+cd rag-system
 ```
 
-2. **环境配置**
+2. **配置环境**
 ```bash
-# 复制环境配置
+# 复制环境配置模板
 cp .env.example .env
-# 编辑配置文件，设置API密钥和数据库连接
+# 编辑 .env 文件，主要配置：
+# - DEEPSEEK_API_KEY: 你的 DeepSeek API 密钥
 nano .env
 ```
 
-3. **启动数据库**
+3. **一键启动**
 ```bash
-# 启动 PostgreSQL 和 Neo4j
-docker-compose up -d postgres neo4j
+./start.sh
 ```
 
-4. **安装依赖**
-```bash
-# Python 后端
-cd RAG-Anything
-pip install -r requirements.txt
+启动脚本会自动：
+- 🐘 启动 PostgreSQL 数据库 (带 pgvector)
+- 🕸️ 启动 Neo4j 图数据库
+- 🚀 启动 Redis 缓存
+- 🔧 创建 Python 虚拟环境并安装依赖
+- 🚀 启动后端 API 服务器
+- 🌐 启动前端开发服务器 (如果安装了 Node.js)
 
-# React 前端
-cd ../webui
-npm install
+4. **访问应用**
+- 📱 前端界面: http://localhost:3000
+- 📋 API 文档: http://localhost:8001/docs
+- 🕸️ Neo4j 浏览器: http://localhost:7474 (neo4j/raganything_neo4j)
+
+5. **停止服务**
+```bash
+./stop.sh
 ```
 
-5. **启动服务**
-```bash
-# 启动 API 服务器
-cd RAG-Anything/api
-python rag_api_server.py
+### 🔧 手动部署 (高级用户)
 
-# 启动前端 (新终端)
-cd webui
-npm run dev
-```
-
-6. **访问应用**
-- 前端界面: http://localhost:3000
-- API 文档: http://localhost:8001/docs
+如果需要自定义部署或出现问题，可以按以下步骤手动操作：
 
 ## 📊 性能指标
 
