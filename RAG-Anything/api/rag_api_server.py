@@ -12,9 +12,22 @@ import uuid
 import psutil
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from pathlib import Path
 import sys
+from contextlib import asynccontextmanager
+
+# 加载环境变量
+from dotenv import load_dotenv
+from pathlib import Path
+
+# 使用绝对路径加载唯一的.env文件
+env_path = '/home/ragsvr/projects/ragsystem/.env'
+load_dotenv(env_path, override=True)
+print(f"加载环境变量文件: {env_path}")
+# 调试：打印Neo4j密码以验证加载正确
+import os
+print(f"Neo4j密码已加载: {os.getenv('NEO4J_PASSWORD')}")
 
 try:
     import torch
@@ -22,16 +35,8 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-# V2 批量处理架构导入
-try:
-    from batch_processing_v2 import create_batch_processor_v2
-    V2_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"V2批量处理模块导入失败: {e}")
-    V2_AVAILABLE = False
-
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -44,6 +49,10 @@ from lightrag.utils import EmbeddingFunc, logger
 from raganything import RAGAnything, RAGAnythingConfig
 from simple_qwen_embed import qwen_embed
 from dotenv import load_dotenv
+
+# 导入数据库配置
+sys.path.append(str(Path(__file__).parent.parent))
+from database_config import load_database_config, create_lightrag_kwargs
 
 # 导入智能路由和文本处理器
 from smart_parser_router import router
@@ -58,76 +67,123 @@ from cache_statistics import initialize_cache_tracking, get_cache_stats_tracker
 # 导入增强的错误处理和进度跟踪
 from enhanced_error_handler import enhanced_error_handler
 from advanced_progress_tracker import advanced_progress_tracker
-# 导入安全文件处理器
-from utils.secure_file_handler import get_secure_file_handler
-# 导入高性能批处理器和内存管理器
-from processing.concurrent_batch_processor import get_batch_processor
-from memory.memory_manager import get_memory_manager
-# 导入简化认证机制
-from auth.simple_auth import get_current_user_optional, get_current_user_required, get_auth
+# 导入连接状态检测器
+from connection_status_checker import RemoteConnectionChecker
 
-# 加载环境变量
-load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)
-load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env.performance", override=True)
+# 注释掉其他.env加载，统一使用上面的绝对路径
+# load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/RAG-Anything/.env", override=False)  # 优先加载RAG-Anything的.env
+# load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env", override=False)  # 备用配置
+# load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/.env.performance", override=True)  # 性能配置覆盖
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="RAG-Anything API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app):
+    """应用生命周期管理器"""
+    # 启动时执行
+    logger.info("🚀 RAG-Anything API服务启动中...")
+    logger.info("=" * 80)
+    
+    # Step 1: 检测远程存储连接状态
+    logger.info("📡 检测远程存储连接状态...")
+    connection_checker = RemoteConnectionChecker(timeout=5.0)
+    connection_results = await connection_checker.check_all_connections()
+    
+    # 检查关键服务连接状态
+    critical_services = ['PostgreSQL', 'Neo4j', 'NFS存储']
+    failed_critical = [name for name, result in connection_results.items() 
+                      if name in critical_services and 
+                      result.status.name in ['FAILED', 'TIMEOUT']]
+    
+    if failed_critical:
+        logger.warning(f"⚠️ 关键服务连接异常: {', '.join(failed_critical)}")
+        logger.warning("服务将继续启动，但可能影响功能完整性")
+    else:
+        logger.info("✅ 所有关键远程服务连接正常")
+    
+    # Step 2: 设置WebSocket日志处理器
+    logger.info("🔧 初始化WebSocket日志处理器...")
+    setup_websocket_logging()
+    websocket_log_handler.set_event_loop(asyncio.get_event_loop())
+    logger.info("✅ WebSocket日志处理器初始化完成")
+    
+    # Step 3: 初始化RAG系统
+    logger.info("🧠 初始化RAG系统...")
+    await initialize_rag()
+    logger.info("✅ RAG系统初始化完成")
+    
+    # Step 4: 加载已存在的文档
+    logger.info("📚 加载已存在的文档...")
+    await load_existing_documents()
+    logger.info(f"✅ 文档加载完成，当前有 {len(documents)} 个文档")
+    
+    # Step 5: 启动完成汇总
+    logger.info("=" * 80)
+    logger.info("🎉 RAG-Anything API服务启动完成!")
+    logger.info(f"📊 服务状态汇总:")
+    logger.info(f"   - 文档数量: {len(documents)}")
+    logger.info(f"   - RAG系统: {'✅ 已初始化' if rag_instance else '❌ 初始化失败'}")
+    logger.info(f"   - 缓存系统: {'✅ 已启用' if cache_enhanced_processor else '❌ 未启用'}")
+    
+    # 显示关键配置信息
+    working_dir = os.getenv('WORKING_DIR', './rag_storage')
+    storage_mode = os.getenv('STORAGE_MODE', 'hybrid')
+    logger.info(f"   - 工作目录: {working_dir}")
+    logger.info(f"   - 存储模式: {storage_mode}")
+    logger.info(f"   - 服务地址: http://localhost:8000")
+    logger.info("=" * 80)
+    
+    yield
+    
+    # 关闭时执行
+    logger.info("🛑 RAG-Anything API服务关闭中...")
+    logger.info("👋 服务已关闭")
 
-# 安全的CORS配置（本地使用）
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # 前端开发服务器
-    "http://127.0.0.1:3000",  # 本地访问变体
-    "http://localhost:5173",  # Vite开发服务器
-    "http://127.0.0.1:5173",  # Vite本地访问变体
-]
-
-# 从环境变量添加额外的允许源
-if os.getenv("ADDITIONAL_CORS_ORIGINS"):
-    additional_origins = os.getenv("ADDITIONAL_CORS_ORIGINS").split(",")
-    ALLOWED_ORIGINS.extend([origin.strip() for origin in additional_origins])
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  # 明确指定允许的源
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],  # 限制HTTP方法
-    allow_headers=["Authorization", "Content-Type"],  # 限制允许的头部
+app = FastAPI(
+    title="RAG-Anything API", 
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# 全局变量（核心组件）
+# 启用CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 全局变量
 rag_instance: Optional[RAGAnything] = None
 cache_enhanced_processor: Optional[CacheEnhancedProcessor] = None
-batch_processor_v2: Optional[Any] = None
-
-# WebSocket连接管理（不需要持久化）
+tasks: Dict[str, dict] = {}
+query_tasks: Dict[str, dict] = {}  # 查询任务单独存储，避免与文档处理任务的数据库schema冲突
+documents: Dict[str, dict] = {}
 active_websockets: Dict[str, WebSocket] = {}
 processing_log_websockets: List[WebSocket] = []  # 文档解析日志WebSocket连接列表
-
-# 使用内存管理器管理状态（替换直接的全局变量）
-memory_manager = get_memory_manager()
-batch_processor = get_batch_processor()
-
-# 兼容性包装器（逐步迁移旧代码）
-tasks = {}  # 将逐步迁移到memory_manager
-documents = {}  # 将逐步迁移到memory_manager  
-batch_operations = {}  # 将逐步迁移到memory_manager
+batch_operations: Dict[str, dict] = {}  # 批量操作状态跟踪
 
 # 日志显示模式
 class LogDisplayMode(BaseModel):
     mode: str = "summary"  # core_only, summary, detailed, all
     include_debug: bool = False
 
-# 配置 - 统一使用环境变量和绝对路径
+# Phase 2: Database-only storage configuration
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/home/ragsvr/projects/ragsystem/uploads")
-WORKING_DIR = os.getenv("WORKING_DIR", "/home/ragsvr/projects/ragsystem/rag_storage")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/home/ragsvr/projects/ragsystem/output")
+WORKING_DIR = os.getenv("WORKING_DIR", "/home/ragsvr/projects/ragsystem/rag_storage")  # Still needed for some operations
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/tmp/rag_output_temp")  # Fixed for Phase 2
+
+# Use temporary directories only for transient file operations
+TEMP_WORKING_DIR = "/tmp/rag_temp"
+TEMP_OUTPUT_DIR = "/tmp/rag_output_temp"
 
 # 确保目录存在
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(WORKING_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(TEMP_WORKING_DIR, exist_ok=True)
+os.makedirs(TEMP_OUTPUT_DIR, exist_ok=True)
 
 # Request/Response 模型
 class QueryRequest(BaseModel):
@@ -189,7 +245,8 @@ PROCESSING_STAGES = [
 def save_documents_state():
     """保存文档和任务状态到磁盘"""
     try:
-        state_file = os.path.join(WORKING_DIR, "api_documents_state.json")
+        # Use TEMP_WORKING_DIR for state persistence
+        state_file = os.path.join(TEMP_WORKING_DIR, "api_documents_state.json")
         state_data = {
             "documents": documents,
             "tasks": tasks,
@@ -198,82 +255,130 @@ def save_documents_state():
         }
         with open(state_file, 'w', encoding='utf-8') as f:
             json.dump(state_data, f, ensure_ascii=False, indent=2)
-        logger.info(f"保存了 {len(documents)} 个文档状态到磁盘")
+        logger.info(f"保存了 {len(documents)} 个文档状态到磁盘: {state_file}")
     except Exception as e:
         logger.error(f"保存文档状态失败: {str(e)}")
 
 async def load_existing_documents():
-    """从RAG存储和API状态文件中加载已存在的文档"""
+    """从数据库加载已存在的文档状态"""
     global documents, tasks, batch_operations
     
-    # 1. 首先尝试加载API服务器自己的状态文件
-    api_state_file = os.path.join(WORKING_DIR, "api_documents_state.json")
-    if os.path.exists(api_state_file):
-        try:
-            with open(api_state_file, 'r', encoding='utf-8') as f:
-                state_data = json.load(f)
-            
-            documents = state_data.get("documents", {})
-            tasks = state_data.get("tasks", {})
-            batch_operations = state_data.get("batch_operations", {})
-            
-            logger.info(f"从API状态文件加载了 {len(documents)} 个文档, {len(tasks)} 个任务")
-        except Exception as e:
-            logger.error(f"加载API状态文件失败: {str(e)}")
-    
-    # 2. 然后加载RAG系统中已处理的文档
-    doc_status_file = os.path.join(WORKING_DIR, "kv_store_doc_status.json")
-    if not os.path.exists(doc_status_file):
-        logger.info("没有找到现有RAG文档状态文件")
-        return
-    
     try:
-        with open(doc_status_file, 'r', encoding='utf-8') as f:
-            doc_status_data = json.load(f)
+        # 从PostgreSQL数据库加载文档状态
+        import asyncpg
         
-        logger.info(f"从RAG存储中发现 {len(doc_status_data)} 个已处理文档")
+        # 数据库连接配置
+        db_config = {
+            'host': os.getenv('POSTGRES_HOST', '/var/run/postgresql'),
+            'port': int(os.getenv('POSTGRES_PORT', 5432)),
+            'database': os.getenv('POSTGRES_DATABASE', 'raganything'),
+            'user': os.getenv('POSTGRES_USER', 'ragsvr'),
+        }
         
-        # 只添加不存在的文档
-        added_count = 0
-        for doc_id, doc_info in doc_status_data.items():
-            if doc_info.get('status') == 'processed':
-                # 检查是否已存在
-                existing = any(d.get('rag_doc_id') == doc_id for d in documents.values())
-                if not existing:
-                    # 生成文档记录
-                    document_id = str(uuid.uuid4())
-                    file_name = os.path.basename(doc_info.get('file_path', f'document_{doc_id}'))
+        # 如果不是Unix socket，添加密码
+        if not db_config['host'].startswith('/'):
+            db_config['password'] = os.getenv('POSTGRES_PASSWORD', '')
+        
+        # 连接数据库
+        conn = await asyncpg.connect(**db_config)
+        
+        try:
+            # 查询所有已处理的文档
+            query = """
+                SELECT id, workspace, status, file_path, content_summary, 
+                       content_length, chunks_count, created_at, updated_at
+                FROM lightrag_doc_status
+                WHERE status IN ('processed', 'completed')
+                ORDER BY created_at DESC
+            """
+            rows = await conn.fetch(query)
+            
+            logger.info(f"从数据库发现 {len(rows)} 个已处理文档")
+            
+            # 加载文档到内存
+            for row in rows:
+                doc_id = row['id']
+                file_path = row['file_path']
+                
+                # 检查文件是否存在于uploads目录
+                if file_path:
+                    # 构建完整的文件路径
+                    full_path = os.path.join(UPLOAD_DIR, os.path.basename(file_path))
+                    if not os.path.exists(full_path):
+                        # 尝试原始路径
+                        full_path = file_path
                     
-                    document = {
-                        "document_id": document_id,
-                        "file_name": file_name,
-                        "file_path": doc_info.get('file_path', ''),
-                        "file_size": doc_info.get('content_length', 0),
-                        "status": "completed",
-                        "created_at": doc_info.get('created_at', datetime.now().isoformat()),
-                        "updated_at": doc_info.get('updated_at', datetime.now().isoformat()),
-                        "processing_time": 0,  # 历史文档没有处理时间记录
-                        "content_length": doc_info.get('content_length', 0),
-                        "chunks_count": doc_info.get('chunks_count', 0),
-                        "rag_doc_id": doc_id,  # 保存RAG系统的文档ID
-                        "content_summary": doc_info.get('content_summary', '')[:100] + "..." if doc_info.get('content_summary') else ""
-                    }
-                    
-                    documents[document_id] = document
-                    added_count += 1
-                    logger.info(f"加载已存在文档: {file_name} (chunks: {doc_info.get('chunks_count', 0)})")
-        
-        logger.info(f"新增 {added_count} 个RAG文档，总共 {len(documents)} 个文档")
-        
+                    if os.path.exists(full_path):
+                        # 生成API文档ID
+                        document_id = str(uuid.uuid4())
+                        
+                        # 创建文档记录
+                        document = {
+                            "document_id": document_id,
+                            "file_name": os.path.basename(file_path),
+                            "file_path": full_path,
+                            "file_size": row['content_length'] or 0,
+                            "status": "completed",  # 数据库中的processed映射为completed
+                            "created_at": row['created_at'].isoformat() if row['created_at'] else datetime.now().isoformat(),
+                            "updated_at": row['updated_at'].isoformat() if row['updated_at'] else datetime.now().isoformat(),
+                            "processing_time": 0,
+                            "rag_doc_id": doc_id,  # 保存RAG文档ID用于关联
+                            "chunks_count": row['chunks_count'] or 0,
+                            "content_summary": row['content_summary'][:200] if row['content_summary'] else ""
+                        }
+                        
+                        documents[document_id] = document
+                        
+                        # 创建对应的任务记录
+                        task_id = str(uuid.uuid4())
+                        task = {
+                            "task_id": task_id,
+                            "document_id": document_id,
+                            "type": "process",
+                            "status": "completed",
+                            "created_at": document["created_at"],
+                            "completed_at": document["updated_at"],
+                            "progress": 100,
+                            "message": "文档已处理完成（从数据库恢复）"
+                        }
+                        tasks[task_id] = task
+            
+            logger.info(f"成功从数据库加载 {len(documents)} 个文档状态")
+            
+        finally:
+            await conn.close()
+            
     except Exception as e:
-        logger.error(f"加载RAG文档失败: {str(e)}")
+        logger.error(f"从数据库加载文档状态失败: {str(e)}")
+        logger.info("将使用空的文档列表启动")
+    
+    # 备用方案：尝试从状态文件加载（如果数据库加载失败）
+    if not documents:
+        api_state_file = os.path.join(TEMP_WORKING_DIR, "api_documents_state.json")
+        if os.path.exists(api_state_file):
+            try:
+                with open(api_state_file, 'r', encoding='utf-8') as f:
+                    state_data = json.load(f)
+                
+                documents = state_data.get("documents", {})
+                tasks = state_data.get("tasks", {})
+                batch_operations = state_data.get("batch_operations", {})
+                
+                logger.info(f"从备用状态文件加载了 {len(documents)} 个文档")
+            except Exception as e:
+                logger.error(f"加载备用状态文件失败: {str(e)}")
 
 async def initialize_rag():
     """初始化RAG系统和缓存增强处理器"""
-    global rag_instance, cache_enhanced_processor, batch_processor_v2
+    global rag_instance, cache_enhanced_processor
+    
+    logger.info("🔧 initialize_rag() 被调用")
     
     if rag_instance is not None:
+        logger.info("✅ RAG实例已存在，直接返回")
         return rag_instance
+    
+    logger.info("🚀 开始初始化新的RAG实例")
     
     try:
         # 检查环境变量
@@ -360,10 +465,19 @@ async def initialize_rag():
             func=qwen_embed,
         )
         
-        # 配置LightRAG缓存设置
-        lightrag_kwargs = {
-            "enable_llm_cache": os.getenv("ENABLE_LLM_CACHE", "true").lower() == "true",
-        }
+        # 配置数据库集成
+        db_config = load_database_config()
+        lightrag_kwargs = create_lightrag_kwargs(db_config)
+        
+        # 保持原有缓存设置的兼容性
+        if "enable_llm_cache" not in lightrag_kwargs:
+            lightrag_kwargs["enable_llm_cache"] = os.getenv("ENABLE_LLM_CACHE", "true").lower() == "true"
+        
+        logger.info(f"数据库集成配置: 存储模式={db_config.storage_mode}, 缓存={db_config.enable_caching}")
+        if db_config.storage_mode in ["hybrid", "postgres_only"]:
+            logger.info(f"PostgreSQL: {db_config.postgres_host}:{db_config.postgres_port}/{db_config.postgres_db}")
+        if db_config.storage_mode in ["hybrid", "neo4j_only"]:
+            logger.info(f"Neo4j: {db_config.neo4j_uri}/{db_config.neo4j_database}")
         
         # 初始化RAGAnything
         rag_instance = RAGAnything(
@@ -400,46 +514,26 @@ async def initialize_rag():
         else:
             logger.info("✓ 工作目录配置一致")
         
-        # 初始化V2批量处理器
-        if V2_AVAILABLE:
-            try:
-                batch_processor_v2 = create_batch_processor_v2(
-                    documents_store=documents,
-                    tasks_store=tasks,
-                    batch_operations=batch_operations,
-                    cache_enhanced_processor=cache_enhanced_processor,
-                    log_callback=send_processing_log
-                )
-                logger.info("✅ V2批量处理器初始化成功")
-            except Exception as e:
-                logger.error(f"V2批量处理器初始化失败: {str(e)}")
-                batch_processor_v2 = None
-        else:
-            logger.warning("V2批量处理模块不可用，使用原有处理器")
-            batch_processor_v2 = None
-        
         return rag_instance
         
     except Exception as e:
         logger.error(f"RAG系统初始化失败: {str(e)}")
+        logger.error(f"初始化错误详情: {type(e).__name__}")
+        import traceback
+        logger.error(f"完整错误堆栈: {traceback.format_exc()}")
+        
+        # 检查关键环境变量
+        env_check = {
+            "DEEPSEEK_API_KEY": bool(os.getenv("DEEPSEEK_API_KEY")),
+            "LLM_BINDING_API_KEY": bool(os.getenv("LLM_BINDING_API_KEY")),
+            "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME"),
+            "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
+            "POSTGRES_USER": os.getenv("POSTGRES_USER"),
+            "POSTGRES_DB": os.getenv("POSTGRES_DB"),
+        }
+        logger.error(f"环境变量检查: {env_check}")
+        
         return None
-
-@app.on_event("startup")
-async def startup_event():
-    """服务启动时初始化RAG系统"""
-    logger.info("=== 服务器启动初始化开始 ===")
-    
-    # 设置WebSocket日志处理器
-    setup_websocket_logging()
-    websocket_log_handler.set_event_loop(asyncio.get_event_loop())
-    
-    logger.info("初始化RAG系统...")
-    await initialize_rag()
-    
-    logger.info("加载已存在的文档...")
-    await load_existing_documents()
-    
-    logger.info(f"=== 服务器启动完成，当前有 {len(documents)} 个文档 ===")
 
 @app.get("/health")
 async def health_check():
@@ -460,7 +554,7 @@ async def health_check():
         },
         "statistics": {
             "active_tasks": len([t for t in tasks.values() if t["status"] == "running"]),
-            "total_tasks": len(tasks),
+            "total_tasks": len(tasks) + len(query_tasks),
             "total_documents": len(documents)
         },
         "system_checks": {
@@ -665,30 +759,6 @@ async def get_system_status():
         }
     }
 
-@app.get("/api/system/auth-status")
-async def get_auth_status(request: Request):
-    """认证状态端点 - 显示当前认证配置"""
-    auth = get_auth()
-    auth_info = auth.get_auth_info()
-    
-    # 检查当前请求是否来自localhost
-    is_localhost = "127.0.0.1" in str(request.client.host) if request.client else False
-    
-    return {
-        "success": True,
-        "auth_config": auth_info,
-        "request_info": {
-            "client_host": str(request.client.host) if request.client else "unknown",
-            "is_localhost": is_localhost,
-            "would_bypass_auth": is_localhost and auth_info["localhost_bypass"]
-        },
-        "usage_info": {
-            "token_required": auth_info["auth_enabled"],
-            "header_format": "Authorization: Bearer <your-token>",
-            "example_curl": f"curl -H 'Authorization: Bearer YOUR_TOKEN' {request.url.replace(path='/api/v1/documents')}"
-        }
-    }
-
 @app.get("/api/system/parser-stats")
 async def get_parser_statistics():
     """获取解析器使用统计"""
@@ -752,6 +822,11 @@ async def process_text_file_direct(task_id: str, file_path: str):
         # 获取RAG实例
         rag = await initialize_rag()
         if not rag:
+            logger.error("RAG实例获取失败，initialize_rag()返回None")
+            logger.error("这通常意味着:")
+            logger.error("1. 环境变量配置问题（API密钥、数据库连接）")
+            logger.error("2. LightRAG初始化失败（存储组件问题）")
+            logger.error("3. 依赖组件不可用（PostgreSQL、Neo4j）")
             raise Exception("RAG系统未初始化")
         
         # 创建详细状态跟踪
@@ -924,6 +999,11 @@ async def process_with_parser(task_id: str, file_path: str, parser_config):
         # 获取RAG实例
         rag = await initialize_rag()
         if not rag:
+            logger.error("RAG实例获取失败，initialize_rag()返回None")
+            logger.error("这通常意味着:")
+            logger.error("1. 环境变量配置问题（API密钥、数据库连接）")
+            logger.error("2. LightRAG初始化失败（存储组件问题）")
+            logger.error("3. 依赖组件不可用（PostgreSQL、Neo4j）")
             raise Exception("RAG系统未初始化")
         
         # 创建详细状态跟踪
@@ -1313,49 +1393,89 @@ async def send_websocket_update(task_id: str, task: dict):
             active_websockets.pop(task_id, None)
 
 async def send_processing_log(message: str, level: str = "info"):
-    """禁用手动日志发送，避免与LightRAG日志系统重复"""
-    # 完全禁用手动日志发送，只使用LightRAG原生日志系统
-    # 这确保没有重复日志，所有日志都通过智能处理器统一处理
-    pass
+    """立即发送处理日志到前端WebSocket客户端"""
+    try:
+        # 添加调试输出以确认函数被调用
+        print(f"[DEBUG] send_processing_log called: {message} (level: {level})")
+        print(f"[DEBUG] processing_log_websockets count: {len(processing_log_websockets)}")
+        # 创建日志数据
+        log_data = {
+            "type": "log",
+            "level": level,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+            "source": "api_processing"
+        }
+        
+        # 立即发送到WebSocket客户端
+        if processing_log_websockets:
+            disconnected = []
+            for ws in list(processing_log_websockets):
+                try:
+                    await ws.send_text(json.dumps(log_data))
+                except Exception:
+                    disconnected.append(ws)
+            
+            # 清理断开的连接
+            for ws in disconnected:
+                if ws in processing_log_websockets:
+                    processing_log_websockets.remove(ws)
+                
+        # 同时发送到logger以确保shell端也能看到
+        level_map = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+            "success": logging.INFO
+        }
+        logger.log(level_map.get(level, logging.INFO), message)
+        
+        # 额外的调试：也尝试通过WebSocket handler发送
+        if websocket_log_handler.websocket_clients:
+            print(f"[DEBUG] Also sending via websocket_log_handler to {len(websocket_log_handler.websocket_clients)} clients")
+            try:
+                # 手动触发WebSocket handler
+                log_record = logging.LogRecord(
+                    name="send_processing_log",
+                    level=level_map.get(level, logging.INFO),
+                    pathname="",
+                    lineno=0,
+                    msg=message,
+                    args=(),
+                    exc_info=None
+                )
+                websocket_log_handler.emit(log_record)
+            except Exception as e:
+                print(f"[DEBUG] Failed to emit via websocket_log_handler: {e}")
+        
+    except Exception as e:
+        print(f"Failed to send processing log: {e}")
+        # 保底方案，至少确保shell端能看到
+        logger.info(message)
 
 @app.post("/api/v1/documents/upload") 
-async def upload_document(
-    file: UploadFile = File(...),
-    current_user: str = Depends(get_current_user_optional)
-):
-    """单文档上传端点 - 保持向后兼容，使用安全文件处理器"""
-    # 获取安全文件处理器
-    secure_handler = get_secure_file_handler()
-    
-    # 安全的文件上传处理
-    try:
-        upload_result = await secure_handler.handle_upload(file)
-    except HTTPException:
-        # 重新抛出HTTP异常
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
-    
-    # 检查文件名重复（使用安全文件名）
-    existing_docs = [doc for doc in documents.values() 
-                    if doc["file_name"] == upload_result["original_filename"]]
+async def upload_document(file: UploadFile = File(...)):
+    """单文档上传端点 - 保持向后兼容"""
+    # 检查文件名重复
+    existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
     if existing_docs:
-        # 删除已上传的文件
-        try:
-            os.unlink(upload_result["file_path"])
-        except:
-            pass
         raise HTTPException(
             status_code=400, 
-            detail=f"文件名 '{upload_result['original_filename']}' 已存在，请重命名后再上传"
+            detail=f"文件名 '{file.filename}' 已存在，请重命名后再上传"
         )
     
     task_id = str(uuid.uuid4())
     document_id = str(uuid.uuid4())
     
-    # 使用安全处理的结果
-    file_path = upload_result["file_path"]
-    actual_file_size = upload_result["file_size"]
+    # 保存上传的文件
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+    
+    # 获取实际文件大小（确保一致性）
+    actual_file_size = os.path.getsize(file_path)
     
     # 创建任务记录
     task = {
@@ -1364,7 +1484,7 @@ async def upload_document(
         "stage": "parsing",
         "progress": 0,
         "file_path": file_path,
-        "file_name": upload_result["original_filename"],
+        "file_name": file.filename,
         "file_size": actual_file_size,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
@@ -1395,7 +1515,7 @@ async def upload_document(
     # 创建文档记录
     document = {
         "document_id": document_id,
-        "file_name": upload_result["original_filename"],
+        "file_name": file.filename,
         "file_path": file_path,
         "file_size": actual_file_size,
         "status": "uploaded",  # 改为uploaded状态，表示已上传但未解析
@@ -1414,20 +1534,14 @@ async def upload_document(
         "message": "Document uploaded successfully, ready for manual processing", 
         "task_id": task_id,
         "document_id": document_id,
-        "file_name": upload_result["original_filename"],
+        "file_name": file.filename,
         "file_size": actual_file_size,
         "status": "uploaded"
     }
 
 @app.post("/api/v1/documents/upload/batch", response_model=BatchUploadResponse)
-async def upload_documents_batch(
-    files: List[UploadFile] = File(...),
-    current_user: str = Depends(get_current_user_optional)
-):
-    """批量文档上传端点 - 使用安全文件处理器"""
-    # 获取安全文件处理器
-    secure_handler = get_secure_file_handler()
-    
+async def upload_documents_batch(files: List[UploadFile] = File(...)):
+    """批量文档上传端点"""
     batch_operation_id = str(uuid.uuid4())
     uploaded_count = 0
     failed_count = 0
@@ -1447,12 +1561,15 @@ async def upload_documents_batch(
     }
     batch_operations[batch_operation_id] = batch_operation
     
-    logger.info(f"开始安全批量上传 {len(files)} 个文件")
-    await send_processing_log(f"📤 开始安全批量上传 {len(files)} 个文件", "info")
+    logger.info(f"开始批量上传 {len(files)} 个文件")
+    await send_processing_log(f"📤 开始批量上传 {len(files)} 个文件", "info")
+    
+    # 支持的文件类型
+    supported_extensions = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.txt', '.md', '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp']
     
     for i, file in enumerate(files):
         file_result = {
-            "file_name": file.filename if file.filename else f"unknown_file_{i}",
+            "file_name": file.filename,
             "file_size": 0,
             "status": "failed",
             "message": "",
@@ -1461,29 +1578,44 @@ async def upload_documents_batch(
         }
         
         try:
-            # 使用安全文件处理器进行上传处理
-            upload_result = await secure_handler.handle_upload(file)
+            # 文件类型验证
+            file_extension = os.path.splitext(file.filename)[1].lower()
+            if file_extension not in supported_extensions:
+                file_result["message"] = f"不支持的文件类型: {file_extension}"
+                failed_count += 1
+                results.append(file_result)
+                batch_operation["failed_items"] += 1
+                continue
             
-            # 检查文件名重复（使用原始文件名）
-            existing_docs = [doc for doc in documents.values() 
-                           if doc["file_name"] == upload_result["original_filename"]]
+            # 检查文件大小（限制100MB）
+            content = await file.read()
+            file_size = len(content)
+            if file_size > 100 * 1024 * 1024:  # 100MB
+                file_result["message"] = "文件大小超过100MB限制"
+                failed_count += 1
+                results.append(file_result)
+                batch_operation["failed_items"] += 1
+                continue
+                
+            # 检查文件名重复
+            existing_docs = [doc for doc in documents.values() if doc["file_name"] == file.filename]
             if existing_docs:
-                # 删除已上传的文件
-                try:
-                    os.unlink(upload_result["file_path"])
-                except:
-                    pass
                 file_result["message"] = "文件名重复，已跳过"
                 failed_count += 1
                 results.append(file_result)
                 batch_operation["failed_items"] += 1
                 continue
             
-            # 创建任务和文档记录
+            # 保存文件
             task_id = str(uuid.uuid4())
             document_id = str(uuid.uuid4())
-            file_path = upload_result["file_path"]
-            actual_file_size = upload_result["file_size"]
+            file_path = os.path.join(UPLOAD_DIR, file.filename)
+            
+            with open(file_path, "wb") as buffer:
+                buffer.write(content)
+            
+            # 获取实际文件大小
+            actual_file_size = os.path.getsize(file_path)
             
             # 创建任务记录
             task = {
@@ -1492,7 +1624,7 @@ async def upload_documents_batch(
                 "stage": "parsing",
                 "progress": 0,
                 "file_path": file_path,
-                "file_name": upload_result["original_filename"],
+                "file_name": file.filename,
                 "file_size": actual_file_size,
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
@@ -1524,7 +1656,7 @@ async def upload_documents_batch(
             # 创建文档记录
             document = {
                 "document_id": document_id,
-                "file_name": upload_result["original_filename"],
+                "file_name": file.filename,
                 "file_path": file_path,
                 "file_size": actual_file_size,
                 "status": "uploaded",
@@ -1549,13 +1681,6 @@ async def upload_documents_batch(
             batch_operation["completed_items"] += 1
             results.append(file_result)
             
-        except HTTPException as e:
-            # HTTP异常包含了安全验证失败的详细信息
-            file_result["message"] = e.detail
-            failed_count += 1
-            batch_operation["failed_items"] += 1
-            results.append(file_result)
-            logger.warning(f"安全验证失败文件 {file.filename}: {e.detail}")
         except Exception as e:
             file_result["message"] = f"上传失败: {str(e)}"
             failed_count += 1
@@ -1643,15 +1768,6 @@ async def process_documents_batch(request: BatchProcessRequest):
     started_count = 0
     failed_count = 0
     results = []
-    
-    # Initialize cache_metrics to prevent UnboundLocalError
-    cache_metrics = {
-        "cache_hits": 0,
-        "cache_misses": 0,
-        "cache_hit_ratio": 0.0,
-        "total_time_saved": 0.0,
-        "efficiency_improvement": 0.0
-    }
     
     # 创建批量操作状态跟踪
     batch_operation = {
@@ -1807,28 +1923,26 @@ async def process_documents_batch(request: BatchProcessRequest):
             
             # 步骤3: 处理批量结果并更新文档状态
             parse_results = batch_result.get("parse_result", {})
-            rag_results = batch_result.get("rag_results", {})
+            # 获取成功和失败的文件列表
+            successful_files = batch_result.get("successful_files", [])
+            failed_files = batch_result.get("failed_files", [])
+            errors = batch_result.get("errors", {})
             successful_rag_files = batch_result.get("successful_rag_files", 0)
             processing_time = batch_result.get("total_processing_time", 0)
-            # Update cache_metrics with actual results, keeping defaults if not available
-            batch_cache_metrics = batch_result.get("cache_metrics", {})
-            if batch_cache_metrics:
-                cache_metrics.update(batch_cache_metrics)
+            cache_metrics = batch_result.get("cache_metrics", {})
             
             # 映射文件路径到文档ID
             path_to_doc = {doc_info["document"]["file_path"]: doc_info for doc_info in valid_documents}
             
-            # 处理成功的文件
+            # 处理每个文件的结果
             for file_path in file_paths:
                 doc_info = path_to_doc[file_path]
                 document_id = doc_info["document_id"]
                 document = doc_info["document"]
                 task_id = doc_info["task_id"]
                 
-                # 检查RAG处理结果
-                rag_result = rag_results.get(file_path, {})
-                
-                if rag_result.get("processed", False):
+                # 检查文件是否在成功列表中
+                if file_path in successful_files:
                     # 成功处理
                     document["status"] = "completed"
                     tasks[task_id]["status"] = "completed"
@@ -1843,8 +1957,8 @@ async def process_documents_batch(request: BatchProcessRequest):
                     })
                     started_count += 1
                 else:
-                    # 处理失败
-                    error_msg = rag_result.get("error", "批量处理过程中出现未知错误")
+                    # 处理失败 - 从errors字典获取错误信息
+                    error_msg = errors.get(file_path, "批量处理过程中出现未知错误")
                     document["status"] = "failed"
                     tasks[task_id]["status"] = "failed"
                     tasks[task_id]["error"] = error_msg
@@ -1966,6 +2080,50 @@ async def process_documents_batch(request: BatchProcessRequest):
         
         raise HTTPException(status_code=500, detail=error_response)
 
+@app.post("/api/v1/query/debug")
+async def debug_query(request: QueryRequest):
+    """调试查询端点 - 测试不同的查询方式"""
+    rag = await initialize_rag()
+    if not rag:
+        return {"error": "RAG系统未初始化", "details": "initialize_rag返回None"}
+    
+    if not request.query.strip():
+        return {"error": "查询内容不能为空"}
+    
+    try:
+        # 首先测试RAG实例的基本属性
+        rag_info = {
+            "type": type(rag).__name__,
+            "working_dir": getattr(rag, 'working_dir', 'unknown'),
+            "has_lightrag": hasattr(rag, 'lightrag'),
+            "lightrag_type": type(getattr(rag, 'lightrag', None)).__name__ if hasattr(rag, 'lightrag') else 'None'
+        }
+        
+        # 测试简单查询（不使用特定mode）
+        if hasattr(rag, 'lightrag') and rag.lightrag:
+            # 尝试直接调用lightrag的query方法
+            simple_result = await rag.lightrag.aquery(request.query)
+            return {
+                "success": True,
+                "method": "direct_lightrag_query",
+                "query": request.query,
+                "result": simple_result,
+                "rag_info": rag_info
+            }
+        else:
+            return {
+                "error": "LightRAG实例不可用",
+                "rag_info": rag_info
+            }
+            
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "rag_info": rag_info if 'rag_info' in locals() else {}
+        }
+
 @app.post("/api/v1/query")
 async def query_documents(request: QueryRequest):
     """查询文档端点"""
@@ -1977,6 +2135,10 @@ async def query_documents(request: QueryRequest):
         raise HTTPException(status_code=400, detail="查询内容不能为空")
     
     try:
+        # 执行查询前的调试信息
+        logger.info(f"准备执行查询: query='{request.query}', mode='{request.mode}', vlm_enhanced={request.vlm_enhanced}")
+        logger.info(f"RAG实例状态: {type(rag).__name__}, working_dir={getattr(rag, 'working_dir', 'unknown')}")
+        
         # 执行查询
         result = await rag.aquery(
             request.query, 
@@ -1984,7 +2146,7 @@ async def query_documents(request: QueryRequest):
             vlm_enhanced=request.vlm_enhanced
         )
         
-        # 记录查询任务
+        # 记录查询任务（使用专门的查询任务存储）
         query_task_id = str(uuid.uuid4())
         query_task = {
             "task_id": query_task_id,
@@ -1996,7 +2158,7 @@ async def query_documents(request: QueryRequest):
             "processing_time": 0.234,  # 模拟处理时间
             "status": "completed"
         }
-        tasks[query_task_id] = query_task
+        query_tasks[query_task_id] = query_task
         
         return {
             "success": True,
@@ -2014,29 +2176,40 @@ async def query_documents(request: QueryRequest):
         }
         
     except Exception as e:
+        import traceback
         logger.error(f"查询失败: {str(e)}")
+        logger.error(f"完整错误堆栈: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 @app.get("/api/v1/tasks")
 async def list_tasks():
     """获取任务列表"""
+    # 合并处理任务和查询任务
+    all_tasks = list(tasks.values()) + list(query_tasks.values())
     return {
         "success": True,
-        "tasks": list(tasks.values()),
-        "total_count": len(tasks),
+        "tasks": all_tasks,
+        "total_count": len(all_tasks),
         "active_tasks": len([t for t in tasks.values() if t["status"] == "running"])
     }
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task(task_id: str):
     """获取特定任务"""
-    if task_id not in tasks:
+    # 首先在处理任务中查找
+    if task_id in tasks:
+        return {
+            "success": True,
+            "task": tasks[task_id]
+        }
+    # 然后在查询任务中查找
+    elif task_id in query_tasks:
+        return {
+            "success": True,
+            "task": query_tasks[task_id]
+        }
+    else:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    return {
-        "success": True,
-        "task": tasks[task_id]
-    }
 
 @app.get("/api/v1/tasks/{task_id}/detailed-status")
 async def get_detailed_task_status(task_id: str):
@@ -2429,7 +2602,7 @@ async def clear_documents():
     if rag:
         try:
             # 读取RAG系统中的所有文档
-            doc_status_file = os.path.join(WORKING_DIR, "kv_store_doc_status.json")
+            doc_status_file = os.path.join(TEMP_WORKING_DIR, "kv_store_doc_status.json")
             if os.path.exists(doc_status_file):
                 logger.info("清理RAG系统中的孤儿文档...")
                 with open(doc_status_file, 'r', encoding='utf-8') as f:
@@ -2488,174 +2661,6 @@ async def clear_documents():
         "details": clear_results
     }
 
-@app.get("/api/v1/documents/scan-uploads-folder")
-async def scan_uploads_folder():
-    """扫描uploads文件夹，发现未处理的文件"""
-    try:
-        upload_dir = os.getenv("UPLOAD_DIR", "/home/ragsvr/projects/ragsystem/uploads")
-        
-        # 支持的文件扩展名
-        supported_extensions = {
-            '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
-            '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp',
-            '.txt', '.md'
-        }
-        
-        # 扫描uploads文件夹
-        found_files = []
-        if os.path.exists(upload_dir):
-            for root, dirs, files in os.walk(upload_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    file_ext = os.path.splitext(file.lower())[1]
-                    
-                    if file_ext in supported_extensions:
-                        file_size = os.path.getsize(file_path)
-                        file_stat = os.stat(file_path)
-                        modified_time = datetime.fromtimestamp(file_stat.st_mtime)
-                        
-                        found_files.append({
-                            'file_name': file,
-                            'file_path': file_path,
-                            'file_size': file_size,
-                            'modified_time': modified_time.isoformat(),
-                            'extension': file_ext
-                        })
-        
-        # 获取已知文档列表
-        existing_filenames = set()
-        for doc in documents.values():
-            existing_filenames.add(doc.get('file_name', ''))
-        
-        # 找出未处理的文件
-        unprocessed_files = []
-        for file_info in found_files:
-            if file_info['file_name'] not in existing_filenames:
-                unprocessed_files.append({
-                    'file_name': file_info['file_name'],
-                    'file_path': file_info['file_path'],
-                    'file_size': file_info['file_size'],
-                    'file_size_display': format_file_size(file_info['file_size']),
-                    'modified_time': file_info['modified_time'],
-                    'extension': file_info['extension']
-                })
-        
-        return {
-            'success': True,
-            'scanned_files': len(found_files),
-            'unprocessed_files': len(unprocessed_files),
-            'unprocessed_file_list': unprocessed_files,
-            'message': f'扫描完成：发现 {len(found_files)} 个文件，其中 {len(unprocessed_files)} 个未处理'
-        }
-        
-    except Exception as e:
-        logger.error(f"扫描uploads文件夹失败: {e}")
-        return {
-            'success': False,
-            'scanned_files': 0,
-            'unprocessed_files': 0,
-            'unprocessed_file_list': [],
-            'message': f'扫描失败: {str(e)}'
-        }
-
-@app.post("/api/v1/documents/process-unprocessed-files")
-async def process_unprocessed_files(request: dict):
-    """批量处理uploads文件夹中未处理的文件"""
-    try:
-        # 先扫描获取未处理文件 
-        scan_response = await scan_uploads_folder()
-        
-        if not scan_response['success'] or scan_response['unprocessed_files'] == 0:
-            return {
-                'success': True,
-                'added_count': 0,
-                'message': '没有发现未处理的文件'
-            }
-        
-        unprocessed_files = scan_response['unprocessed_file_list']
-        added_documents = []
-        failed_files = []
-        
-        # 为每个未处理文件创建文档记录
-        for file_info in unprocessed_files:
-            try:
-                document_id = str(uuid.uuid4())
-                task_id = str(uuid.uuid4())
-                
-                # 创建文档记录
-                document = {
-                    "document_id": document_id,
-                    "file_name": file_info['file_name'],
-                    "file_path": file_info['file_path'],  
-                    "file_size": file_info['file_size'],
-                    "status": "uploaded",
-                    "created_at": datetime.now().isoformat(),
-                    "updated_at": datetime.now().isoformat(),
-                    "task_id": task_id
-                }
-                
-                # 添加到内存存储
-                documents[document_id] = document
-                
-                # 创建任务记录
-                tasks[task_id] = {
-                    "task_id": task_id,
-                    "document_id": document_id,
-                    "status": "pending",
-                    "file_name": file_info['file_name'],
-                    "created_at": datetime.now().isoformat(),
-                    "progress": 0,
-                    "stage": "等待处理"
-                }
-                
-                added_documents.append({
-                    'document_id': document_id,
-                    'file_name': file_info['file_name'],
-                    'file_size': file_info['file_size'],
-                    'task_id': task_id
-                })
-                
-            except Exception as e:
-                logger.error(f"添加文件失败 {file_info['file_name']}: {e}")
-                failed_files.append({
-                    'file_name': file_info['file_name'],
-                    'error': str(e)
-                })
-        
-        # 保存状态
-        save_documents_state()
-        
-        return {
-            'success': True,
-            'added_count': len(added_documents),
-            'failed_count': len(failed_files),
-            'total_files': len(unprocessed_files),
-            'added_documents': added_documents,
-            'failed_files': failed_files,
-            'message': f'成功添加 {len(added_documents)} 个文件到处理队列'
-        }
-        
-    except Exception as e:
-        logger.error(f"批量处理失败: {e}")
-        return {
-            'success': False,
-            'added_count': 0,
-            'failed_count': 0,
-            'total_files': 0,
-            'message': f'批量处理失败: {str(e)}'
-        }
-
-def format_file_size(size_bytes: int) -> str:
-    """格式化文件大小显示"""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    else:
-        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
-
 @app.websocket("/ws/task/{task_id}")
 async def websocket_task_endpoint(websocket: WebSocket, task_id: str):
     """任务进度WebSocket端点"""
@@ -2690,10 +2695,24 @@ async def websocket_processing_logs(websocket: WebSocket):
     # Accept all origins (similar to CORS middleware configuration)
     await websocket.accept()
     
-    # 只添加到智能日志处理器，避免重复
+    # 添加到智能日志处理器和处理日志WebSocket列表
     websocket_log_handler.add_websocket_client(websocket)
+    processing_log_websockets.append(websocket)
+    
+    print(f"[DEBUG] WebSocket connected! Total connections: {len(processing_log_websockets)}")
     
     try:
+        # 立即发送测试消息
+        test_message = {
+            "type": "log",
+            "level": "info", 
+            "message": "🎯 WebSocket连接测试消息 - 如果您看到这个，说明连接正常！",
+            "timestamp": datetime.now().isoformat(),
+            "source": "websocket_test"
+        }
+        await websocket.send_text(json.dumps(test_message))
+        print(f"[DEBUG] Test message sent successfully")
+        
         # 发送连接确认 - 通过新的日志系统
         await send_processing_log("WebSocket连接已建立，准备接收LightRAG实时日志...", "info")
         
@@ -2708,8 +2727,27 @@ async def websocket_processing_logs(websocket: WebSocket):
     except Exception as e:
         logger.error(f"处理日志WebSocket错误: {e}")
     finally:
-        # 只从智能日志处理器中移除
+        # 从智能日志处理器和处理日志WebSocket列表中移除
         websocket_log_handler.remove_websocket_client(websocket)
+        if websocket in processing_log_websockets:
+            processing_log_websockets.remove(websocket)
+
+@app.post("/api/v1/test/websocket-log")
+async def test_websocket_log():
+    """测试WebSocket日志发送"""
+    test_message = "🧪 WebSocket测试消息 - " + datetime.now().strftime("%H:%M:%S")
+    print(f"[DEBUG] Testing WebSocket with message: {test_message}")
+    print(f"[DEBUG] processing_log_websockets count: {len(processing_log_websockets)}")
+    print(f"[DEBUG] websocket_log_handler.websocket_clients count: {len(websocket_log_handler.websocket_clients)}")
+    
+    await send_processing_log(test_message, "info")
+    
+    return {
+        "success": True,
+        "message": "Test message sent",
+        "websocket_count": len(processing_log_websockets),
+        "handler_count": len(websocket_log_handler.websocket_clients)
+    }
 
 @app.get("/api/v1/batch-operations/{batch_operation_id}", response_model=BatchOperationStatus)
 async def get_batch_operation_status(batch_operation_id: str):
@@ -2731,44 +2769,6 @@ async def get_batch_operation_status(batch_operation_id: str):
         completed_at=batch_operation.get("completed_at"),
         results=batch_operation.get("results", [])
     )
-
-# V2 批量处理端点 - 新架构
-@app.post("/api/v1/documents/process/batch/v2", response_model=BatchProcessResponse)
-async def process_documents_batch_v2(request: BatchProcessRequest):
-    """V2批量文档处理端点 - 使用新架构解决cache_metrics等问题
-    
-    主要改进:
-    1. 所有变量都有默认初始化，避免UnboundLocalError
-    2. 职责清晰分离，每个组件单一职责
-    3. 统一的错误处理和状态恢复机制
-    4. 类型安全的数据结构
-    """
-    global batch_processor_v2
-    
-    # 检查V2处理器是否可用
-    if not batch_processor_v2:
-        # 尝试初始化V2处理器
-        await initialize_rag()
-        if not batch_processor_v2:
-            # 如果V2不可用，回退到V1端点
-            logger.warning("V2批量处理器不可用，回退到V1端点")
-            return await process_documents_batch(request)
-    
-    try:
-        # 使用V2架构处理批量请求
-        result = await batch_processor_v2.process_documents_batch_v2(
-            document_ids=request.document_ids,
-            parser=request.parser or "mineru",
-            parse_method=request.parse_method or "auto"
-        )
-        
-        # 转换为标准响应格式
-        return BatchProcessResponse(**result)
-        
-    except Exception as e:
-        logger.error(f"V2批量处理失败，回退到V1: {str(e)}")
-        # 如果V2失败，回退到V1端点
-        return await process_documents_batch(request)
 
 @app.get("/api/v1/batch-operations")
 async def list_batch_operations(limit: int = 50, status: Optional[str] = None):
@@ -3059,6 +3059,491 @@ async def clear_cache_statistics():
             "success": False,
             "error": f"清除缓存统计失败: {str(e)}"
         }
+
+# ===== 图谱可视化API端点 =====
+
+@app.get("/api/v1/graph/nodes")
+async def get_graph_nodes(limit: int = 100):
+    """获取知识图谱节点数据"""
+    try:
+        rag = await initialize_rag()
+        if not rag:
+            raise HTTPException(status_code=503, detail="RAG系统未初始化")
+        
+        # 检查存储模式和数据库配置
+        db_config = load_database_config()
+        nodes = []
+        
+        if db_config.storage_mode in ["hybrid", "neo4j_only"]:
+            # 从Neo4j获取节点数据
+            try:
+                from neo4j import GraphDatabase
+                
+                driver = GraphDatabase.driver(
+                    db_config.neo4j_uri,
+                    auth=(db_config.neo4j_username, db_config.neo4j_password)
+                )
+                
+                with driver.session() as session:
+                    # 获取实体节点
+                    result = session.run(f"""
+                        MATCH (n)
+                        RETURN id(n) as node_id, labels(n) as labels, n as properties
+                        LIMIT {limit}
+                    """)
+                    
+                    for record in result:
+                        node_data = {
+                            "id": str(record["node_id"]),
+                            "label": record["properties"].get("name", record["properties"].get("id", "Unknown")),
+                            "type": record["labels"][0] if record["labels"] else "Entity",
+                            "properties": dict(record["properties"])
+                        }
+                        nodes.append(node_data)
+                
+                driver.close()
+                
+            except Exception as e:
+                logger.warning(f"Neo4j查询失败，尝试PostgreSQL备用方案: {e}")
+                # 备用：从PostgreSQL获取数据
+                nodes = _get_nodes_from_postgres(limit)
+        elif db_config.storage_mode == "postgres_only":
+            # 直接从PostgreSQL获取节点数据
+            nodes = _get_nodes_from_postgres(limit)
+        else:
+            # 从文件存储获取节点数据
+            nodes = _get_nodes_from_file_storage(limit)
+        
+        return {
+            "success": True,
+            "nodes": nodes,
+            "total": len(nodes),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"获取图谱节点失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取图谱节点失败: {str(e)}")
+
+@app.get("/api/v1/graph/relationships") 
+async def get_graph_relationships(limit: int = 100):
+    """获取知识图谱关系数据"""
+    try:
+        rag = await initialize_rag()
+        if not rag:
+            raise HTTPException(status_code=503, detail="RAG系统未初始化")
+        
+        # 检查存储模式和数据库配置
+        db_config = load_database_config()
+        relationships = []
+        
+        if db_config.storage_mode in ["hybrid", "neo4j_only"]:
+            # 从Neo4j获取关系数据
+            try:
+                from neo4j import GraphDatabase
+                
+                driver = GraphDatabase.driver(
+                    db_config.neo4j_uri,
+                    auth=(db_config.neo4j_username, db_config.neo4j_password)
+                )
+                
+                with driver.session() as session:
+                    # 获取关系
+                    result = session.run(f"""
+                        MATCH (a)-[r]->(b)
+                        RETURN id(a) as source_id, id(b) as target_id, 
+                               type(r) as relationship_type, r as properties
+                        LIMIT {limit}
+                    """)
+                    
+                    for record in result:
+                        rel_data = {
+                            "source": str(record["source_id"]),
+                            "target": str(record["target_id"]),
+                            "type": record["relationship_type"],
+                            "properties": dict(record["properties"])
+                        }
+                        relationships.append(rel_data)
+                
+                driver.close()
+                
+            except Exception as e:
+                logger.warning(f"Neo4j关系查询失败，尝试PostgreSQL备用方案: {e}")
+                # 备用：从PostgreSQL获取数据
+                relationships = _get_relationships_from_postgres(limit)
+        elif db_config.storage_mode == "postgres_only":
+            # 直接从PostgreSQL获取关系数据
+            relationships = _get_relationships_from_postgres(limit)
+        else:
+            # 从文件存储获取关系数据
+            relationships = _get_relationships_from_file_storage(limit)
+        
+        return {
+            "success": True,
+            "relationships": relationships,
+            "total": len(relationships),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"获取图谱关系失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取图谱关系失败: {str(e)}")
+
+@app.get("/api/v1/graph/subgraph/{entity_name}")
+async def get_entity_subgraph(entity_name: str, depth: int = 2):
+    """获取特定实体的子图"""
+    try:
+        rag = await initialize_rag()
+        if not rag:
+            raise HTTPException(status_code=503, detail="RAG系统未初始化")
+        
+        # 检查存储模式和数据库配置
+        db_config = load_database_config()
+        nodes = []
+        relationships = []
+        
+        if db_config.storage_mode in ["hybrid", "neo4j_only"]:
+            # 从Neo4j获取子图数据
+            try:
+                from neo4j import GraphDatabase
+                
+                driver = GraphDatabase.driver(
+                    db_config.neo4j_uri,
+                    auth=(db_config.neo4j_username, db_config.neo4j_password)
+                )
+                
+                with driver.session() as session:
+                    # 获取以指定实体为中心的子图
+                    result = session.run(f"""
+                        MATCH path = (center)-[*1..{depth}]-(connected)
+                        WHERE center.name = $entity_name OR center.id = $entity_name
+                        WITH nodes(path) as path_nodes, relationships(path) as path_rels
+                        UNWIND path_nodes as n
+                        RETURN DISTINCT id(n) as node_id, labels(n) as labels, n as properties
+                    """, entity_name=entity_name)
+                    
+                    node_ids = set()
+                    for record in result:
+                        node_id = str(record["node_id"])
+                        if node_id not in node_ids:
+                            node_data = {
+                                "id": node_id,
+                                "label": record["properties"].get("name", record["properties"].get("id", "Unknown")),
+                                "type": record["labels"][0] if record["labels"] else "Entity", 
+                                "properties": dict(record["properties"])
+                            }
+                            nodes.append(node_data)
+                            node_ids.add(node_id)
+                    
+                    # 获取子图中的关系
+                    if node_ids:
+                        result = session.run(f"""
+                            MATCH (a)-[r]->(b)
+                            WHERE id(a) IN $node_ids AND id(b) IN $node_ids
+                            RETURN id(a) as source_id, id(b) as target_id,
+                                   type(r) as relationship_type, r as properties
+                        """, node_ids=list(map(int, node_ids)))
+                        
+                        for record in result:
+                            rel_data = {
+                                "source": str(record["source_id"]),
+                                "target": str(record["target_id"]),
+                                "type": record["relationship_type"],
+                                "properties": dict(record["properties"])
+                            }
+                            relationships.append(rel_data)
+                
+                driver.close()
+                
+            except Exception as e:
+                logger.warning(f"Neo4j子图查询失败: {e}")
+                return {
+                    "success": False,
+                    "error": f"子图查询失败: {str(e)}",
+                    "nodes": [],
+                    "relationships": []
+                }
+        else:
+            # 备用：从文件存储获取相关数据
+            nodes, relationships = _get_subgraph_from_file_storage(entity_name, depth)
+        
+        return {
+            "success": True,
+            "entity": entity_name,
+            "depth": depth,
+            "nodes": nodes,
+            "relationships": relationships,
+            "node_count": len(nodes),
+            "relationship_count": len(relationships),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"获取实体子图失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取实体子图失败: {str(e)}")
+
+def _get_nodes_from_postgres(limit: int = 100):
+    """从PostgreSQL获取节点数据"""
+    nodes = []
+    try:
+        import psycopg2
+        import json
+        
+        # 从环境变量获取连接信息
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=os.getenv("POSTGRES_PORT", 5432),
+            database=os.getenv("POSTGRES_DATABASE", "raganything"),
+            user=os.getenv("POSTGRES_USER", "ragsvr"),
+            password=os.getenv("POSTGRES_PASSWORD", "ragsvr123")
+        )
+        
+        cur = conn.cursor()
+        
+        # 查询entities表 - lightrag_vdb_entity存储实体向量数据
+        # 使用实际的列名: id, entity_name, content
+        cur.execute("""
+            SELECT id, entity_name, content, workspace, file_path
+            FROM lightrag_vdb_entity 
+            LIMIT %s
+        """, (limit,))
+        
+        for row in cur.fetchall():
+            entity_id = row[0]
+            entity_name = row[1] if row[1] else "Unknown"
+            content = row[2] if row[2] else ""
+            workspace = row[3] if row[3] else ""
+            file_path = row[4] if row[4] else ""
+            
+            # 创建节点数据
+            node_data = {
+                "id": entity_id,
+                "label": entity_name,
+                "type": "Entity",  # 可以从content中解析更多类型信息
+                "properties": {
+                    "name": entity_name,
+                    "content": content[:500] if content else "",  # 限制内容长度
+                    "workspace": workspace,
+                    "file_path": file_path,
+                    "description": content[:200] if content else ""  # 简短描述
+                }
+            }
+            nodes.append(node_data)
+        
+        cur.close()
+        conn.close()
+        
+        logger.info(f"从PostgreSQL获取了 {len(nodes)} 个节点")
+        
+    except Exception as e:
+        logger.error(f"从PostgreSQL读取节点失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    return nodes
+
+def _get_nodes_from_file_storage(limit: int = 100):
+    """从文件存储获取节点数据（备用方案）"""
+    nodes = []
+    try:
+        # Phase 2: Use temporary directory for file-based fallback
+        entities_file = os.path.join(TEMP_WORKING_DIR, "vdb_entities.json")
+        if os.path.exists(entities_file):
+            with open(entities_file, 'r', encoding='utf-8') as f:
+                entities_data = json.load(f)
+                entity_list = entities_data.get("data", [])
+                
+                for i, entity in enumerate(entity_list[:limit]):
+                    if isinstance(entity, list) and len(entity) >= 2:
+                        # entity format: [id, entity_name, entity_type, description, content]
+                        node_data = {
+                            "id": str(i),
+                            "label": entity[1] if len(entity) > 1 else "Unknown",
+                            "type": entity[2] if len(entity) > 2 else "Entity",
+                            "properties": {
+                                "name": entity[1] if len(entity) > 1 else "Unknown",
+                                "description": entity[3] if len(entity) > 3 else "",
+                                "content": entity[4] if len(entity) > 4 else ""
+                            }
+                        }
+                        nodes.append(node_data)
+    except Exception as e:
+        logger.error(f"从文件存储读取节点失败: {e}")
+    
+    return nodes
+
+def _get_relationships_from_postgres(limit: int = 100):
+    """从PostgreSQL获取关系数据"""
+    relationships = []
+    try:
+        import psycopg2
+        import json
+        
+        # 从环境变量获取连接信息
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=os.getenv("POSTGRES_PORT", 5432),
+            database=os.getenv("POSTGRES_DATABASE", "raganything"),
+            user=os.getenv("POSTGRES_USER", "ragsvr"),
+            password=os.getenv("POSTGRES_PASSWORD", "ragsvr123")
+        )
+        
+        cur = conn.cursor()
+        
+        # 首先获取所有实体名称到ID的映射
+        cur.execute("""
+            SELECT id, entity_name 
+            FROM lightrag_vdb_entity
+        """)
+        
+        entity_name_to_id = {}
+        for row in cur.fetchall():
+            entity_id = row[0]
+            entity_name = row[1]
+            if entity_name:
+                entity_name_to_id[entity_name] = entity_id
+        
+        logger.info(f"加载了 {len(entity_name_to_id)} 个实体名称到ID的映射")
+        
+        # 查询relationships表 - lightrag_vdb_relation存储关系向量数据
+        # 使用实际的列名: id, source_id, target_id, content
+        cur.execute("""
+            SELECT id, source_id, target_id, content, workspace, file_path
+            FROM lightrag_vdb_relation 
+            LIMIT %s
+        """, (limit,))
+        
+        for row in cur.fetchall():
+            rel_id = row[0]
+            source_name = row[1] if row[1] else ""
+            target_name = row[2] if row[2] else ""
+            content = row[3] if row[3] else ""
+            workspace = row[4] if row[4] else ""
+            file_path = row[5] if row[5] else ""
+            
+            # 将实体名称映射到实体ID
+            source_id = entity_name_to_id.get(source_name, source_name)
+            target_id = entity_name_to_id.get(target_name, target_name)
+            
+            # 从content中尝试解析关系类型
+            # content通常包含关系描述，例如: "source_entity -> relationship_type -> target_entity"
+            relationship_type = "RELATED_TO"  # 默认关系类型
+            if content and "->" in content:
+                parts = content.split("->")
+                if len(parts) >= 3:
+                    relationship_type = parts[1].strip()
+            elif content and "\t" in content:
+                # 处理tab分隔的格式: "source\ttarget\nrelation_type\ndescription"
+                lines = content.split("\n")
+                if len(lines) > 1:
+                    relationship_type = lines[1].strip() if lines[1] else "RELATED_TO"
+            
+            relationship = {
+                "source": source_id,  # 使用实体ID而不是名称
+                "target": target_id,  # 使用实体ID而不是名称
+                "type": relationship_type,
+                "properties": {
+                    "source_name": source_name,  # 保留原始名称
+                    "target_name": target_name,  # 保留原始名称
+                    "content": content[:500] if content else "",  # 限制内容长度
+                    "workspace": workspace,
+                    "file_path": file_path,
+                    "description": content[:200] if content else "",
+                    "weight": 1.0  # 默认权重
+                }
+            }
+            relationships.append(relationship)
+        
+        cur.close()
+        conn.close()
+        
+        logger.info(f"从PostgreSQL获取了 {len(relationships)} 个关系")
+        
+    except Exception as e:
+        logger.error(f"从PostgreSQL读取关系失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    return relationships
+
+def _get_relationships_from_file_storage(limit: int = 100):
+    """从文件存储获取关系数据（备用方案）"""
+    relationships = []
+    try:
+        # Phase 2: Use temporary directory for file-based fallback
+        relationships_file = os.path.join(TEMP_WORKING_DIR, "vdb_relationships.json")
+        if os.path.exists(relationships_file):
+            with open(relationships_file, 'r', encoding='utf-8') as f:
+                relationships_data = json.load(f)
+                rel_list = relationships_data.get("data", [])
+                
+                for i, rel in enumerate(rel_list[:limit]):
+                    if isinstance(rel, list) and len(rel) >= 3:
+                        # relationship format: [id, source_entity, target_entity, relationship_type, description, weight]
+                        rel_data = {
+                            "source": str(hash(rel[1]) % 1000),  # 简化的ID映射
+                            "target": str(hash(rel[2]) % 1000),
+                            "type": rel[3] if len(rel) > 3 else "RELATED_TO",
+                            "properties": {
+                                "description": rel[4] if len(rel) > 4 else "",
+                                "weight": rel[5] if len(rel) > 5 else 1.0
+                            }
+                        }
+                        relationships.append(rel_data)
+    except Exception as e:
+        logger.error(f"从文件存储读取关系失败: {e}")
+    
+    return relationships
+
+def _get_subgraph_from_file_storage(entity_name: str, depth: int = 2):
+    """从文件存储获取子图数据（备用方案）"""
+    nodes = []
+    relationships = []
+    
+    try:
+        # 获取所有节点和关系
+        all_nodes = _get_nodes_from_file_storage(1000)
+        all_relationships = _get_relationships_from_file_storage(1000)
+        
+        # 找到中心实体
+        center_node = None
+        for node in all_nodes:
+            if (node["properties"].get("name", "").lower() == entity_name.lower() or 
+                node["label"].lower() == entity_name.lower()):
+                center_node = node
+                break
+        
+        if not center_node:
+            return nodes, relationships
+        
+        # 简化的子图查找（基于实体名称匹配）
+        related_nodes = {center_node["id"]: center_node}
+        related_relationships = []
+        
+        # 找到相关关系
+        for rel in all_relationships:
+            source_match = any(node["id"] == rel["source"] and 
+                             entity_name.lower() in node["label"].lower() 
+                             for node in all_nodes)
+            target_match = any(node["id"] == rel["target"] and 
+                             entity_name.lower() in node["label"].lower() 
+                             for node in all_nodes)
+            
+            if source_match or target_match:
+                related_relationships.append(rel)
+                
+                # 添加相关节点
+                for node in all_nodes:
+                    if node["id"] == rel["source"] or node["id"] == rel["target"]:
+                        related_nodes[node["id"]] = node
+        
+        nodes = list(related_nodes.values())
+        relationships = related_relationships
+        
+    except Exception as e:
+        logger.error(f"从文件存储获取子图失败: {e}")
+    
+    return nodes, relationships
 
 if __name__ == "__main__":
     print("🚀 Starting RAG-Anything API Server with Enhanced Error Handling & Advanced Progress Tracking")

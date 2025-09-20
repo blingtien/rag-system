@@ -184,19 +184,31 @@ class RAGManager:
             )
             
             # 记录初始化信息
-            logger.info("RAG系统初始化成功")
-            logger.info(f"数据目录: {settings.working_dir}")
-            logger.info(f"输出目录: {settings.output_dir}")
-            logger.info(f"RAGAnything工作目录: {self._rag_instance.working_dir}")
-            logger.info(f"LLM: DeepSeek API")
-            logger.info(f"嵌入: 本地Qwen3-Embedding-0.6B")
-            logger.info(f"缓存配置: Parse Cache={settings.enable_parse_cache}, LLM Cache={settings.enable_llm_cache}")
+            logger.info("🎯 RAG系统初始化成功")
+            logger.info("📋 系统配置信息:")
+            logger.info(f"   📁 数据目录: {settings.working_dir}")
+            logger.info(f"   📤 输出目录: {settings.output_dir}")
+            logger.info(f"   🏠 RAGAnything工作目录: {self._rag_instance.working_dir}")
+            logger.info(f"   🤖 LLM模型: DeepSeek API ({settings.llm_binding_host})")
+            logger.info(f"   🔤 嵌入模型: 本地Qwen3-Embedding-0.6B")
+            logger.info(f"   💾 缓存配置: Parse Cache={settings.enable_parse_cache}, LLM Cache={settings.enable_llm_cache}")
             
             # 验证目录一致性
             if self._rag_instance.working_dir != settings.working_dir:
-                logger.warning(f"工作目录不一致! API服务器: {settings.working_dir}, RAGAnything: {self._rag_instance.working_dir}")
+                logger.warning(f"⚠️ 工作目录不一致! API服务器: {settings.working_dir}, RAGAnything: {self._rag_instance.working_dir}")
             else:
-                logger.info("✓ 工作目录配置一致")
+                logger.info("✅ 工作目录配置一致")
+                
+            # 显示存储后端信息
+            storage_mode = getattr(settings, 'storage_mode', 'hybrid')
+            logger.info(f"🗄️ 存储模式: {storage_mode}")
+            if storage_mode in ['hybrid', 'postgres_only']:
+                postgres_host = os.getenv('POSTGRES_HOST', 'localhost')
+                postgres_db = os.getenv('POSTGRES_DB', 'raganything')
+                logger.info(f"   📊 PostgreSQL: {postgres_host}/{postgres_db}")
+            if storage_mode in ['hybrid', 'neo4j_only']:
+                neo4j_uri = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
+                logger.info(f"   🕸️ Neo4j: {neo4j_uri}")
                 
         except Exception as e:
             logger.error(f"RAG系统初始化失败: {str(e)}")
